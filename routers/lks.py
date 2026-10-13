@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, HTTPException
-import pandas as pd
+# import pandas as pd
 import io
 from database import supabase
 
@@ -13,8 +13,8 @@ async def upload_full_rapot(request: Request):
         if not contents:
             raise HTTPException(status_code=400, detail="File Excel kosong")
 
-        excel_file = pd.ExcelFile(io.BytesIO(contents))
-        sheet_names = excel_file.sheet_names
+        # excel_file = pd.ExcelFile(io.BytesIO(contents))
+        # sheet_names = excel_file.sheet_names
 
         # ... (Logika pemrosesan sheet dan upsert ke Supabase)
 
