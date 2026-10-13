@@ -2,26 +2,26 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import salesmen, stores, lks
 
-app = FastAPI(
-    title="SPA Dashboard API",
-    description="Backend API untuk Salesforce Performance Assistance System (Supabase + FastAPI)",
-    version="1.0.0"
-)
+app = FastAPI(title="SPA Performance API")
 
-# Konfigurasi CORS agar React/Vite Frontend bisa mengakses API ini
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://itshardtofindname.github.io", # URL GitHub Pages Frontend
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Ganti dengan URL Frontend kamu saat produksi
+    allow_origins=["*"], # Bebaskan saat dev, batasi ke origins saat prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Register Routers
 app.include_router(salesmen.router)
 app.include_router(stores.router)
 app.include_router(lks.router)
 
 @app.get("/")
 def root():
-    return {"message": "API SPA Dashboard Aktif dan Terhubung!"}
+    return {"status": "SPA Backend Active"}
