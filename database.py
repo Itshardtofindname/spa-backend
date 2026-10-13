@@ -1,7 +1,11 @@
+import os
 from supabase import create_client, Client
-from config import SUPABASE_URL, SUPABASE_KEY
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("SUPABASE_URL dan SUPABASE_KEY harus diisi di file .env")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+# Inisialisasi aman tanpa melempar fatal exception di level top-module
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
