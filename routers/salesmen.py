@@ -23,11 +23,12 @@ def read_filter_options():
     return get_filter_options()
 
 
+
 @router.get("/performance")
 def read_salesman_performance(
-    office: str | None = Query(default=None),
-    group: str | None = Query(default=None),
-    salesman: str | None = Query(default=None),
+    office: str = Query(..., min_length=1),
+    group: str = Query(..., min_length=1),
+    salesman: str = Query(..., min_length=1),
 ):
     results = get_salesman_performance(
         office=office,
@@ -39,6 +40,15 @@ def read_salesman_performance(
         raise HTTPException(
             status_code=404,
             detail="Data performa salesman tidak ditemukan",
+        )
+
+    if len(results) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Kombinasi Sales Office, Group Product, dan Salesman "
+                "menghasilkan lebih dari satu data."
+            ),
         )
 
     sales_data = results[0]
