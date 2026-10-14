@@ -1,15 +1,13 @@
-import os
-from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import Client, create_client
 
-# Wajib ditambahkan agar variabel di file .env terbaca saat dijalankan di lokal
-load_dotenv()
+from config import SUPABASE_KEY, SUPABASE_URL
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "SUPABASE_URL dan SUPABASE_KEY wajib diatur."
+    )
 
-# Inisialisasi aman tanpa melempar exception crash
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-else:
-    supabase = None
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_KEY,
+)

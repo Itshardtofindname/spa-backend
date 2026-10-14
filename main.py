@@ -1,27 +1,34 @@
 from fastapi import FastAPI
-from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from routers import salesmen, stores, lks
 
-app = FastAPI(title="SPA Backend API")
+from config import CORS_ORIGINS
+from routers import lks, salesmen, stores
+
+app = FastAPI(
+    title="SPA Dashboard API",
+    description="Backend API untuk Salesforce Performance Assistance System",
+    version="1.0.0",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Endpoint khusus menangani favicon request dari browser
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    return Response(content=b"", media_type="image/x-icon")
+
+@app.get("/", tags=["Health"])
+def root():
+    return {"status": "SPA Backend Active"}
+
+
+@app.get("/health", tags=["Health"])
+def health_check():
+    return {"status": "ok"}
+
 
 app.include_router(salesmen.router)
 app.include_router(stores.router)
 app.include_router(lks.router)
-
-@app.get("/")
-def root():
-    return {"status": "SPA Backend Active"}
