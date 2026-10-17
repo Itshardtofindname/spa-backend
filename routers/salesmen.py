@@ -1,4 +1,4 @@
-
+from database import supabase
 from fastapi import APIRouter, HTTPException, Query
 
 from services.salesmen_service import (
@@ -104,3 +104,74 @@ def read_salesman_performance(
         "kekuatanSales": sales_data.get("kekuatanSales", []),
         "catatanSupervisor": sales_data.get("catatanSupervisor", ""),
     }
+
+@router.get("/{npk}/stores")
+def get_salesman_stores(npk: str):
+    """Ambil data salesman dan daftar toko yang ditugaskan kepadanya."""
+    try:
+        salesman_response = (
+            supabase.table("salesmen")
+            .select("id,npk,nama,sales_office,grup_product")
+            .eq("npk", npk)
+            .limit(1)
+            .execute()
+        )
+
+        if not salesman_response.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Salesman tidak ditemukan.",
+            )
+
+        salesman = salesman_response.data[0]
+
+        stores_response = (
+            supabase.table("stores")
+            .select("*")
+            .eq("salesman_id", salesman["id"])
+            .order("nama_toko")
+            .execute()
+        )
+
+        stores = stores_response.data or []
+        customer_codes = [store["cust_no"] for store in stores]
+
+        # store_profiles memakai kode pelanggan, bukan UUID toko.
+        profiles_by_code = {}
+
+        if customer_codes:
+            profiles_response = (
+                supabase.table("store_profiles")
+                .select("*")
+                .in_("store_id", customer_codes)
+                .execute()
+            )
+
+            profiles_by_code = {
+                profile["store_id"]: profile
+                for profile in (profiles_response.data or [])
+            }
+
+        connected_stores = []
+
+        for store in stores:
+            profile = profiles_by_code.get(store["cust_no"])
+
+            connected_stores.append({
+                **store,
+                "sellingToolkit": profile,
+            })
+
+        return {
+            "salesman": salesman,
+            "totalStores": len(connected_stores),
+            "stores": connected_stores,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Gagal mengambil daftar toko milik salesman.",
+        ) from exc
