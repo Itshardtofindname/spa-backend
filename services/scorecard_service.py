@@ -1,6 +1,7 @@
 
+import calendar
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from io import BytesIO
 
 from openpyxl import load_workbook
@@ -12,35 +13,58 @@ TARGET_SHEET = "Produktifitas"
 
 
 def normalize_header(value):
+    """Menyeragamkan nama kolom Excel."""
     if value is None:
         return ""
 
     text = str(value).strip().lower()
-    text = text.replace(".", "")
+    text = re.sub(r"[_./-]+", " ", text)
     text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def normalize_npk(value):
+    """Mengubah NPK menjadi string yang konsisten."""
+    if value is None or isinstance(value, bool):
+        return ""
+
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+
+    text = str(value).strip()
+
+    # Menangani NPK yang terbaca sebagai 1584.0
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".")[0]
 
     return text
 
 
-def normalize_npk(value):
+def normalize_name(value):
+    """Menyeragamkan nama untuk pencocokan data lama."""
     if value is None:
         return ""
 
-    # Excel terkadang menyimpan NPK numerik sebagai float.
-    if isinstance(value, float) and value.is_integer():
-        value = int(value)
-
-    return str(value).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        str(value).strip().casefold(),
+    )
 
 
 def parse_number(value):
-    if value is None or str(value).strip() == "":
+    """Mengubah nilai Excel menjadi float."""
+    if value is None or isinstance(value, bool):
         return None
 
     if isinstance(value, (int, float)):
         return float(value)
 
     text = str(value).strip().replace(" ", "")
+
+    if not text:
+        return None
 
     if "," in text and "." not in text:
         text = text.replace(",", ".")
@@ -52,34 +76,58 @@ def parse_number(value):
 
 
 def get_month_label(value):
+    """Mengubah header bulan menjadi format Jan-26."""
     if isinstance(value, (datetime, date)):
         return value.strftime("%b-%y")
 
     if value is None:
         return None
 
-    text = str(value).strip()
+    text = re.sub(r"\s+", " ", str(value).strip())
 
     match = re.match(
-        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
-        r"[- ]?(\d{2,4})$",
+        r"^([A-Za-z]+)[- /]+(\d{2,4})$",
         text,
-        re.IGNORECASE,
     )
 
     if not match:
         return None
 
-    month = match.group(1).title()
-    year = match.group(2)
+    month_text = match.group(1).lower()
+    year_text = match.group(2)
 
-    if len(year) == 4:
-        year = year[-2:]
+    month_number = next(
+        (
+            number
+            for number in range(1, 13)
+            if month_text in {
+                calendar.month_abbr[number].lower(),
+                calendar.month_name[number].lower(),
+            }
+        ),
+        None,
+    )
 
-    return f"{month}-{year}"
+    if month_number is None:
+        return None
+
+    year_number = int(year_text)
+
+    if len(year_text) == 2:
+        year_number += 2000
+
+    try:
+        return date(
+            year_number,
+            month_number,
+            1,
+        ).strftime("%b-%y")
+    except ValueError:
+        return None
 
 
 def find_header_row(sheet):
+    """Mencari baris header NPK, SALESMAN, dan PH."""
     for row_number in range(1, min(sheet.max_row, 30) + 1):
         values = [
             normalize_header(cell.value)
@@ -88,7 +136,7 @@ def find_header_row(sheet):
 
         has_npk = "npk" in values
         has_salesman = any(
-            value in ("salesman", "nama salesman")
+            value in {"salesman", "nama salesman"}
             for value in values
         )
         has_ph = "ph" in values
@@ -99,12 +147,62 @@ def find_header_row(sheet):
     return None
 
 
+def is_valid_salesman_row(npk, name, ph):
+    """Memastikan baris merupakan data salesman."""
+    if not npk or not name or not ph:
+        return False
+
+    if not re.fullmatch(r"\d+", npk):
+        return False
+
+    if normalize_header(name) in {
+        "total",
+        "subtotal",
+        "grand total",
+        "high",
+        "medium",
+        "low",
+    }:
+        return False
+
+    if not re.fullmatch(r"TL\d+[A-Z]?", ph.upper()):
+        return False
+
+    return True
+
+
+def get_existing_records(sales_office, report_period):
+    """
+    Mengambil data lama pada kantor dan periode yang sama.
+    UUID dipakai sebagai identitas row yang tidak berubah.
+    """
+    response = (
+        supabase.table("scorecard_productivity")
+        .select("id, npk, salesman")
+        .eq("sales_office", sales_office)
+        .eq("report_period", report_period)
+        .execute()
+    )
+
+    return response.data or []
+
+
 def import_scorecard_excel(
     file_bytes,
     sales_office,
     report_period,
     source_file,
 ):
+    """
+    Import data Excel dengan memperbarui row yang sudah ada.
+
+    Strategi pencocokan:
+    1. Cari berdasarkan NPK.
+    2. Jika NPK berubah, cari berdasarkan nama salesman
+       yang cocok secara unik dalam kantor dan periode sama.
+    3. Gunakan UUID lama agar row yang sama diperbarui.
+    4. Jika tidak ditemukan, buat row baru.
+    """
     workbook = load_workbook(
         BytesIO(file_bytes),
         read_only=True,
@@ -123,8 +221,8 @@ def import_scorecard_excel(
 
         if header_row is None:
             raise ValueError(
-                "Header tidak ditemukan. Pastikan ada kolom "
-                "NPK, SALESMAN, dan PH."
+                "Header tidak ditemukan. Pastikan sheet memiliki "
+                "kolom NPK, SALESMAN, dan PH."
             )
 
         header_cells = [
@@ -136,7 +234,6 @@ def import_scorecard_excel(
             for value in header_cells
         ]
 
-        # Simpan indeks header pertama untuk setiap nama kolom.
         columns = {}
 
         for index, header in enumerate(headers):
@@ -146,14 +243,14 @@ def import_scorecard_excel(
         month_columns = {}
 
         for index, value in enumerate(header_cells):
-            label = get_month_label(value)
+            month_label = get_month_label(value)
 
-            if label and label not in month_columns:
-                month_columns[label] = index
+            if month_label and month_label not in month_columns:
+                month_columns[month_label] = index
 
-        def get_value(row, *names):
-            for name in names:
-                index = columns.get(name)
+        def get_value(row, *aliases):
+            for alias in aliases:
+                index = columns.get(normalize_header(alias))
 
                 if index is not None and index < len(row):
                     return row[index]
@@ -162,71 +259,69 @@ def import_scorecard_excel(
 
         records_by_npk = {}
         duplicate_npks = set()
+        skipped_rows = 0
 
-        # Hanya membaca tabel setelah header pertama.
-        # Berhenti jika menemukan header tabel berikutnya.
         for row in sheet.iter_rows(
             min_row=header_row + 1,
             values_only=True,
         ):
             normalized_row = [
-                normalize_header(value) for value in row
+                normalize_header(value)
+                for value in row
             ]
 
+            # Berhenti jika tabel berikutnya dimulai.
             if (
                 "npk" in normalized_row
                 and any(
-                    value in ("salesman", "nama salesman")
+                    value in {"salesman", "nama salesman"}
                     for value in normalized_row
                 )
                 and "ph" in normalized_row
             ):
-                logger_message = (
-                    "Header tabel berikutnya ditemukan; "
-                    "pembacaan tabel pertama dihentikan."
-                )
-                print(logger_message)
                 break
 
-            npk_value = get_value(row, "npk")
-            salesman_value = get_value(
-                row, "salesman", "nama salesman"
+            npk = normalize_npk(get_value(row, "npk"))
+
+            name_value = get_value(
+                row,
+                "salesman",
+                "nama salesman",
             )
+
+            name = (
+                str(name_value).strip()
+                if name_value is not None
+                else ""
+            )
+
             ph_value = get_value(row, "ph")
+            ph = (
+                str(ph_value).strip().upper()
+                if ph_value is not None
+                else ""
+            )
 
-            if (
-                npk_value is None
-                or salesman_value is None
-                or ph_value is None
-            ):
-                continue
-
-            npk = normalize_npk(npk_value)
-            salesman = str(salesman_value).strip()
-            ph = str(ph_value).strip()
-
-            if not npk or not salesman or not ph:
-                continue
-
-            if normalize_header(npk) in {
-                "npk", "total", "subtotal", "grand total"
-            }:
+            if not is_valid_salesman_row(npk, name, ph):
+                skipped_rows += 1
                 continue
 
             monthly_values = {}
 
             for month, index in month_columns.items():
-                if index < len(row):
-                    value = parse_number(row[index])
+                if index >= len(row):
+                    continue
 
-                    if value is not None:
-                        monthly_values[month] = value
+                value = parse_number(row[index])
+
+                if value is not None:
+                    monthly_values[month] = value
 
             record = {
                 "sales_office": sales_office,
                 "report_period": report_period,
                 "npk": npk,
-                "salesman": salesman,
+                "salesman": name,
                 "ph": ph,
                 "monthly_values": monthly_values,
                 "q1": parse_number(get_value(row, "q1")),
@@ -235,14 +330,16 @@ def import_scorecard_excel(
                 ),
                 "oa": parse_number(get_value(row, "oa")),
                 "r_order": parse_number(
-                    get_value(row, "rorder", "r order")
+                    get_value(row, "r order", "rorder")
                 ),
                 "cross_sell": parse_number(
-                    get_value(row, "cross sell")
+                    get_value(row, "cross sell", "crosssell")
                 ),
                 "dks": parse_number(get_value(row, "dks")),
                 "source_file": source_file,
-                "updated_at": datetime.now().astimezone().isoformat(),
+                "updated_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
             }
 
             if npk in records_by_npk:
@@ -253,25 +350,112 @@ def import_scorecard_excel(
 
         if duplicate_npks:
             raise ValueError(
-                "NPK duplikat ditemukan pada tabel pertama: "
+                "Impor dibatalkan karena ditemukan NPK duplikat: "
                 + ", ".join(sorted(duplicate_npks))
-                + ". Impor dibatalkan agar data tidak tertimpa "
-                "secara tidak sengaja."
             )
 
         records = list(records_by_npk.values())
 
         if not records:
             raise ValueError(
-                "Tidak ada baris Scorecard yang valid pada "
-                f"sheet '{TARGET_SHEET}'."
+                "Tidak ada baris salesman valid yang ditemukan. "
+                "Periksa header dan format kolom Excel."
             )
 
-        response = (
+        # Ambil row lama untuk kantor dan periode yang sama.
+        existing_records = get_existing_records(
+            sales_office,
+            report_period,
+        )
+
+        existing_by_npk = {}
+        existing_by_name = {}
+
+        for existing in existing_records:
+            old_npk = normalize_npk(existing.get("npk"))
+            old_name = normalize_name(existing.get("salesman"))
+
+            if old_npk:
+                existing_by_npk.setdefault(
+                    old_npk, []
+                ).append(existing)
+
+            if old_name:
+                existing_by_name.setdefault(
+                    old_name, []
+                ).append(existing)
+
+        # Cocokkan record Excel dengan UUID lama.
+        matched_existing_ids = set()
+        prepared_records = []
+        matched_by_npk = 0
+        matched_by_name = 0
+        new_records = 0
+
+        for record in records:
+            npk = record["npk"]
+            name_key = normalize_name(record["salesman"])
+
+            # Prioritas pertama: NPK yang sama.
+            npk_matches = existing_by_npk.get(npk, [])
+
+            if len(npk_matches) > 1:
+                raise ValueError(
+                    f"Ditemukan beberapa row lama dengan NPK {npk}. "
+                    "Bersihkan data duplikat sebelum import."
+                )
+
+            existing = npk_matches[0] if npk_matches else None
+
+            if existing is not None:
+                if existing["id"] in matched_existing_ids:
+                    raise ValueError(
+                        f"Row lama untuk NPK {npk} cocok dengan lebih "
+                        "dari satu baris Excel."
+                    )
+
+                matched_by_npk += 1
+
+            else:
+                # Prioritas kedua: nama sama jika NPK berubah.
+                name_matches = existing_by_name.get(name_key, [])
+
+                # Abaikan row lama yang sudah dipakai oleh record lain.
+                name_matches = [
+                    item
+                    for item in name_matches
+                    if item["id"] not in matched_existing_ids
+                ]
+
+                if len(name_matches) > 1:
+                    raise ValueError(
+                        f"Nama '{record['salesman']}' cocok dengan "
+                        "beberapa row lama. Import dibatalkan untuk "
+                        "menghindari perubahan pada row yang salah."
+                    )
+
+                if len(name_matches) == 1:
+                    existing = name_matches[0]
+                    matched_by_name += 1
+
+            if existing is not None:
+                # Pertahankan UUID lama agar row yang sama diperbarui.
+                record["id"] = existing["id"]
+                matched_existing_ids.add(existing["id"])
+            else:
+                # Tidak ada pasangan lama; ini merupakan row baru.
+                new_records += 1
+
+            prepared_records.append(record)
+
+        # Konflik berdasarkan UUID, bukan NPK.
+        # Ini memungkinkan NPK berubah tanpa membuat row baru
+        # apabila nama salesman cocok secara unik.
+        (
             supabase.table("scorecard_productivity")
             .upsert(
-                records,
-                on_conflict="sales_office,report_period,npk",
+                prepared_records,
+                on_conflict="id",
             )
             .execute()
         )
@@ -279,9 +463,13 @@ def import_scorecard_excel(
         return {
             "message": "Impor Scorecard berhasil",
             "sheet": TARGET_SHEET,
-            "sheet_rows_imported": len(records),
+            "sheet_rows_imported": len(prepared_records),
+            "updated_by_npk": matched_by_npk,
+            "updated_by_name": matched_by_name,
+            "new_rows": new_records,
+            "skipped_rows": skipped_rows,
             "sales_office": sales_office,
-            "report_period": report_period,
+            "report_period": str(report_period),
             "source_file": source_file,
         }
 
@@ -289,7 +477,11 @@ def import_scorecard_excel(
         workbook.close()
 
 
-def get_scorecard_productivity(sales_office, report_period):
+def get_scorecard_productivity(
+    sales_office,
+    report_period,
+):
+    """Mengambil Scorecard berdasarkan kantor dan periode."""
     response = (
         supabase.table("scorecard_productivity")
         .select("*")
