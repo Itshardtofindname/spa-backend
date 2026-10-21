@@ -18,6 +18,7 @@ from services.scorecard_service import (
     get_scorecard_productivity,
     import_scorecard_excel,
 )
+from services.scorecard_drive_sync import sync_scorecard_from_drive
 
 router = APIRouter(
     prefix="/api/scorecard",
@@ -54,6 +55,58 @@ def verify_import_token(token):
             status_code=401,
             detail="Token impor tidak valid",
         )
+        
+
+def verify_cron_token(authorization):
+    """Memastikan endpoint otomatis hanya dipanggil scheduler berizin."""
+    expected = os.getenv("CRON_SECRET")
+
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Konfigurasi CRON_SECRET belum tersedia",
+        )
+
+    prefix = "Bearer "
+    if not authorization or not authorization.startswith(prefix):
+        raise HTTPException(
+            status_code=401,
+            detail="Autentikasi scheduler tidak valid",
+        )
+
+    token = authorization[len(prefix):].strip()
+
+    if not secrets.compare_digest(token, expected):
+        raise HTTPException(
+            status_code=401,
+            detail="Autentikasi scheduler tidak valid",
+        )
+
+
+@router.get("/sync-drive/cron")
+def scheduled_sync_drive_scorecard(
+    authorization: Annotated[str | None, Header()] = None,
+):
+    """Sinkronisasi otomatis dari Google Drive untuk scheduler."""
+    verify_cron_token(authorization)
+
+    try:
+        return sync_scorecard_from_drive(
+            sales_office=DEFAULT_SALES_OFFICE,
+            report_period=DEFAULT_REPORT_PERIOD.isoformat(),
+            dry_run=False,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sinkronisasi Google Drive gagal: {exc}",
+        )
+
 
 
 def build_month_columns(report_period: date):
@@ -154,3 +207,27 @@ async def upload_scorecard_excel(
         )
     finally:
         await file.close()
+
+
+@router.post("/sync-drive")
+def sync_drive_scorecard(
+    x_import_token: Annotated[str | None, Header()] = None,
+    sales_office: str = Query(DEFAULT_SALES_OFFICE, min_length=1),
+    report_period: date = Query(DEFAULT_REPORT_PERIOD),
+    dry_run: bool = Query(True),
+):
+    """Sinkronisasi Drive; dry_run aktif secara default."""
+    verify_import_token(x_import_token)
+    try:
+        return sync_scorecard_from_drive(
+            sales_office=sales_office,
+            report_period=report_period.isoformat(),
+            dry_run=dry_run,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sinkronisasi Google Drive gagal: {exc}",
+        )

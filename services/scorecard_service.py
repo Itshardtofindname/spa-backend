@@ -192,6 +192,7 @@ def import_scorecard_excel(
     sales_office,
     report_period,
     source_file,
+    dry_run=False,
 ):
     """
     Import data Excel dengan memperbarui row yang sudah ada.
@@ -362,6 +363,27 @@ def import_scorecard_excel(
                 "Periksa header dan format kolom Excel."
             )
 
+        # Mode validasi: tidak membaca atau menulis database.
+        if dry_run:
+            return {
+                "message": "Validasi berhasil; database tidak diakses",
+                "dry_run": True,
+                "sheet": TARGET_SHEET,
+                "sheet_rows_imported": len(records),
+                "skipped_rows": skipped_rows,
+                "sales_office": sales_office,
+                "report_period": str(report_period),
+                "source_file": source_file,
+                "preview": [
+                    {
+                        "npk": record["npk"],
+                        "salesman": record["salesman"],
+                        "ph": record["ph"],
+                        "monthly_values": record["monthly_values"],
+                    }
+                    for record in records[:5]
+                ],
+            }
         # Ambil row lama untuk kantor dan periode yang sama.
         existing_records = get_existing_records(
             sales_office,
@@ -440,6 +462,12 @@ def import_scorecard_excel(
 
             if existing is not None:
                 # Pertahankan UUID lama agar row yang sama diperbarui.
+                conflicting_npk = existing_by_npk.get(npk, [])
+                if any(item["id"] != existing["id"] for item in conflicting_npk):
+                    raise ValueError(
+                        f"NPK {npk} sudah dimiliki row lain pada kantor dan periode ini. "
+                        "Import dibatalkan untuk mencegah konflik data."
+                    )
                 record["id"] = existing["id"]
                 matched_existing_ids.add(existing["id"])
             else:
