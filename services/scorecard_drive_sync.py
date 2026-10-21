@@ -157,8 +157,7 @@ def sync_scorecard_from_drive(
         source_rows = (
             client.table("scorecard_sources")
             .select("last_file_hash,sync_status")
-            .eq("sales_office", sales_office)
-            .eq("report_period", report_period)
+            .eq("source_path", source_path)
             .limit(1)
             .execute()
             .data
@@ -243,5 +242,5 @@ def _write_source_status(
     if status == "synced":
         row["last_synced_at"] = datetime.now(timezone.utc).isoformat()
     client.table("scorecard_sources").upsert(
-        row, on_conflict="sales_office,report_period"
+        row, on_conflict="source_path"
     ).execute()
