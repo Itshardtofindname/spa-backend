@@ -1,4 +1,3 @@
-
 import calendar
 import re
 from datetime import date, datetime, timezone
@@ -34,7 +33,7 @@ def normalize_npk(value):
 
     text = str(value).strip()
 
-    # Menangani NPK yang terbaca sebagai 1584.0
+    # Menangani NPK yang terbaca sebagai 1584.0.
     if re.fullmatch(r"\d+\.0+", text):
         text = text.split(".")[0]
 
@@ -100,7 +99,8 @@ def get_month_label(value):
         (
             number
             for number in range(1, 13)
-            if month_text in {
+            if month_text
+            in {
                 calendar.month_abbr[number].lower(),
                 calendar.month_name[number].lower(),
             }
@@ -171,13 +171,16 @@ def is_valid_salesman_row(npk, name, ph):
     return True
 
 
-def get_existing_records(sales_office, report_period):
-    """
-    Mengambil data lama pada kantor dan periode yang sama.
-    UUID dipakai sebagai identitas row yang tidak berubah.
-    """
+def get_existing_records(
+    sales_office,
+    report_period,
+    db_client=None,
+):
+    """Mengambil identitas data lama untuk kantor dan periode yang sama."""
+    client = db_client if db_client is not None else supabase
+
     response = (
-        supabase.table("scorecard_productivity")
+        client.table("scorecard_productivity")
         .select("id, npk, salesman")
         .eq("sales_office", sales_office)
         .eq("report_period", report_period)
@@ -193,16 +196,19 @@ def import_scorecard_excel(
     report_period,
     source_file,
     dry_run=False,
+    db_client=None,
 ):
     """
     Import data Excel dengan memperbarui row yang sudah ada.
 
     Strategi pencocokan:
-    1. Cari berdasarkan NPK.
-    2. Jika NPK berubah, cari berdasarkan nama salesman
-       yang cocok secara unik dalam kantor dan periode sama.
-    3. Gunakan UUID lama agar row yang sama diperbarui.
-    4. Jika tidak ditemukan, buat row baru.
+    1. Cocokkan NPK terlebih dahulu.
+    2. Jika NPK berubah, cocokkan nama yang unik.
+    3. Pertahankan UUID lama jika pasangan ditemukan.
+    4. Buat row baru jika tidak ada pasangan.
+    5. Tidak menghapus row lama yang tidak ditemukan di Excel.
+
+    Mode dry_run tidak membaca atau menulis database.
     """
     workbook = load_workbook(
         BytesIO(file_bytes),
@@ -282,7 +288,9 @@ def import_scorecard_excel(
             ):
                 break
 
-            npk = normalize_npk(get_value(row, "npk"))
+            npk = normalize_npk(
+                get_value(row, "npk")
+            )
 
             name_value = get_value(
                 row,
@@ -297,6 +305,7 @@ def import_scorecard_excel(
             )
 
             ph_value = get_value(row, "ph")
+
             ph = (
                 str(ph_value).strip().upper()
                 if ph_value is not None
@@ -325,18 +334,24 @@ def import_scorecard_excel(
                 "salesman": name,
                 "ph": ph,
                 "monthly_values": monthly_values,
-                "q1": parse_number(get_value(row, "q1")),
+                "q1": parse_number(
+                    get_value(row, "q1")
+                ),
                 "perform": parse_number(
                     get_value(row, "perform")
                 ),
-                "oa": parse_number(get_value(row, "oa")),
+                "oa": parse_number(
+                    get_value(row, "oa")
+                ),
                 "r_order": parse_number(
                     get_value(row, "r order", "rorder")
                 ),
                 "cross_sell": parse_number(
                     get_value(row, "cross sell", "crosssell")
                 ),
-                "dks": parse_number(get_value(row, "dks")),
+                "dks": parse_number(
+                    get_value(row, "dks")
+                ),
                 "source_file": source_file,
                 "updated_at": datetime.now(
                     timezone.utc
@@ -366,7 +381,9 @@ def import_scorecard_excel(
         # Mode validasi: tidak membaca atau menulis database.
         if dry_run:
             return {
-                "message": "Validasi berhasil; database tidak diakses",
+                "message": (
+                    "Validasi berhasil; database tidak diakses"
+                ),
                 "dry_run": True,
                 "sheet": TARGET_SHEET,
                 "sheet_rows_imported": len(records),
@@ -379,23 +396,33 @@ def import_scorecard_excel(
                         "npk": record["npk"],
                         "salesman": record["salesman"],
                         "ph": record["ph"],
-                        "monthly_values": record["monthly_values"],
+                        "monthly_values": record[
+                            "monthly_values"
+                        ],
                     }
                     for record in records[:5]
                 ],
             }
-        # Ambil row lama untuk kantor dan periode yang sama.
+
+        # Client dipilih setelah dry-run agar validasi tidak mengakses DB.
+        client = db_client if db_client is not None else supabase
+
         existing_records = get_existing_records(
             sales_office,
             report_period,
+            db_client=client,
         )
 
         existing_by_npk = {}
         existing_by_name = {}
 
         for existing in existing_records:
-            old_npk = normalize_npk(existing.get("npk"))
-            old_name = normalize_name(existing.get("salesman"))
+            old_npk = normalize_npk(
+                existing.get("npk")
+            )
+            old_name = normalize_name(
+                existing.get("salesman")
+            )
 
             if old_npk:
                 existing_by_npk.setdefault(
@@ -407,7 +434,6 @@ def import_scorecard_excel(
                     old_name, []
                 ).append(existing)
 
-        # Cocokkan record Excel dengan UUID lama.
         matched_existing_ids = set()
         prepared_records = []
         matched_by_npk = 0
@@ -416,9 +442,11 @@ def import_scorecard_excel(
 
         for record in records:
             npk = record["npk"]
-            name_key = normalize_name(record["salesman"])
+            name_key = normalize_name(
+                record["salesman"]
+            )
 
-            # Prioritas pertama: NPK yang sama.
+            # Prioritas pertama: NPK sama.
             npk_matches = existing_by_npk.get(npk, [])
 
             if len(npk_matches) > 1:
@@ -427,22 +455,27 @@ def import_scorecard_excel(
                     "Bersihkan data duplikat sebelum import."
                 )
 
-            existing = npk_matches[0] if npk_matches else None
+            existing = (
+                npk_matches[0]
+                if npk_matches
+                else None
+            )
 
             if existing is not None:
                 if existing["id"] in matched_existing_ids:
                     raise ValueError(
-                        f"Row lama untuk NPK {npk} cocok dengan lebih "
-                        "dari satu baris Excel."
+                        f"Row lama untuk NPK {npk} cocok dengan "
+                        "lebih dari satu baris Excel."
                     )
 
                 matched_by_npk += 1
 
             else:
-                # Prioritas kedua: nama sama jika NPK berubah.
-                name_matches = existing_by_name.get(name_key, [])
+                # Prioritas kedua: nama unik jika NPK berubah.
+                name_matches = existing_by_name.get(
+                    name_key, []
+                )
 
-                # Abaikan row lama yang sudah dipakai oleh record lain.
                 name_matches = [
                     item
                     for item in name_matches
@@ -461,26 +494,32 @@ def import_scorecard_excel(
                     matched_by_name += 1
 
             if existing is not None:
-                # Pertahankan UUID lama agar row yang sama diperbarui.
-                conflicting_npk = existing_by_npk.get(npk, [])
-                if any(item["id"] != existing["id"] for item in conflicting_npk):
+                # Cegah NPK baru mengambil identitas row lain.
+                conflicting_npk = existing_by_npk.get(
+                    npk, []
+                )
+
+                if any(
+                    item["id"] != existing["id"]
+                    for item in conflicting_npk
+                ):
                     raise ValueError(
-                        f"NPK {npk} sudah dimiliki row lain pada kantor dan periode ini. "
-                        "Import dibatalkan untuk mencegah konflik data."
+                        f"NPK {npk} sudah dimiliki row lain pada "
+                        "kantor dan periode ini. Import dibatalkan "
+                        "untuk mencegah konflik data."
                     )
+
                 record["id"] = existing["id"]
                 matched_existing_ids.add(existing["id"])
+
             else:
-                # Tidak ada pasangan lama; ini merupakan row baru.
                 new_records += 1
 
             prepared_records.append(record)
 
-        # Konflik berdasarkan UUID, bukan NPK.
-        # Ini memungkinkan NPK berubah tanpa membuat row baru
-        # apabila nama salesman cocok secara unik.
+        # Upsert menggunakan client yang sama dengan proses pencocokan.
         (
-            supabase.table("scorecard_productivity")
+            client.table("scorecard_productivity")
             .upsert(
                 prepared_records,
                 on_conflict="id",
