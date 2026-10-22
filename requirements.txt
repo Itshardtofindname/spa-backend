@@ -5,3 +5,7 @@ python-dotenv
 pydantic
 pandas
 openpyxl
+python-multipart
+watchdog
+google-api-python-client
+google-auth

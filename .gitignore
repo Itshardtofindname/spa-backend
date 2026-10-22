@@ -1,7 +1,14 @@
-# Environment variables
+
+# Environment variables and secrets
 .env
 .env.*
 !.env.example
+!.env.*.example
+
+# Google service account credentials
+google-service-account.json
+*service-account*.json
+*service_account*.json
 
 # Python cache
 __pycache__/
@@ -16,7 +23,13 @@ env/
 # Testing and coverage
 .pytest_cache/
 .coverage
+.coverage.*
 htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+*.egg-info/
 
 # Editors and operating systems
 .vscode/
