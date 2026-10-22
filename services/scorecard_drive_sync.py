@@ -281,24 +281,10 @@ def sync_scorecard_from_drive(
         )
 
         # Lewati hanya jika hash sama dan sinkronisasi sebelumnya sukses.
-        if (
+        file_unchanged = (
             previous_hash == remote["sha256"]
             and previous_status == "synced"
-        ):
-            return {
-                "message": (
-                    "File tidak berubah untuk periode ini; "
-                    "sinkronisasi dilewati."
-                ),
-                "changed": False,
-                "dry_run": False,
-                "file_id": actual_file_id,
-                "file_name": remote["file_name"],
-                "sha256": remote["sha256"],
-                "sales_office": sales_office,
-                "report_period": report_period,
-                "sync_status": "synced",
-            }
+        )
 
         # 7. Impor data aktual.
         import_result = import_scorecard_excel(
@@ -323,7 +309,13 @@ def sync_scorecard_from_drive(
 
         return {
             **import_result,
-            "changed": True,
+            "message": (
+                "File tidak berubah; rekonsiliasi database tetap dijalankan."
+                if file_unchanged
+                else "Sinkronisasi Scorecard berhasil."
+            ),
+            "changed": not file_unchanged,
+            "reconciled": True,
             "dry_run": False,
             "file_id": actual_file_id,
             "file_name": remote["file_name"],

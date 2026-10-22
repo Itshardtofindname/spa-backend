@@ -189,6 +189,49 @@ def get_existing_records(
 
     return response.data or []
 
+def sync_salesmen_master(records, db_client=None):
+    """
+    Menyinkronkan identitas salesman ke public.salesmen.
+
+    NPK menjadi kunci identitas.
+    Hanya mengisi atau memperbarui:
+    - npk
+    - nama
+    - sales_office
+    - grup_product
+
+    Kolom lain, termasuk JSON dan catatan supervisor,
+    tidak disertakan dalam payload.
+    """
+    client = db_client if db_client is not None else supabase
+
+    master_records = [
+        {
+            "npk": record["npk"],
+            "nama": record["salesman"],
+            "sales_office": record["sales_office"],
+            "grup_product": record["ph"],
+        }
+        for record in records
+    ]
+
+    if not master_records:
+        raise ValueError(
+            "Tidak ada data salesman untuk disinkronkan."
+        )
+
+    (
+        client.table("salesmen")
+        .upsert(
+            master_records,
+            on_conflict="npk",
+        )
+        .execute()
+    )
+
+    return {
+        "salesmen_master_upserted": len(master_records),
+    }
 
 def import_scorecard_excel(
     file_bytes,
@@ -517,7 +560,14 @@ def import_scorecard_excel(
 
             prepared_records.append(record)
 
-        # Upsert menggunakan client yang sama dengan proses pencocokan.
+                # 1. Sinkronkan master salesman berdasarkan NPK.
+        # Hanya dijalankan setelah dry-run selesai dilewati.
+        master_result = sync_salesmen_master(
+            records,
+            db_client=client,
+        )
+
+        # 2. Simpan data produktivitas Scorecard.
         (
             client.table("scorecard_productivity")
             .upsert(
@@ -528,7 +578,7 @@ def import_scorecard_excel(
         )
 
         return {
-            "message": "Impor Scorecard berhasil",
+            "message": "Impor Scorecard dan master salesman berhasil",
             "sheet": TARGET_SHEET,
             "sheet_rows_imported": len(prepared_records),
             "updated_by_npk": matched_by_npk,
@@ -538,6 +588,7 @@ def import_scorecard_excel(
             "sales_office": sales_office,
             "report_period": str(report_period),
             "source_file": source_file,
+            **master_result,
         }
 
     finally:
