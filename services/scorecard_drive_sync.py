@@ -1,8 +1,8 @@
-
 import base64
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -17,6 +17,11 @@ from services.scorecard_service import import_scorecard_excel
 DRIVE_READONLY_SCOPE = [
     "https://www.googleapis.com/auth/drive.readonly"
 ]
+
+XLSX_MIME_TYPE = (
+    "application/vnd.openxmlformats-officedocument."
+    "spreadsheetml.sheet"
+)
 
 
 def get_drive_credentials():
@@ -33,14 +38,17 @@ def get_drive_credentials():
         )
 
     if credentials_base64:
-        decoded = base64.b64decode(credentials_base64).decode("utf-8")
+        decoded = base64.b64decode(
+            credentials_base64
+        ).decode("utf-8")
+
         info = json.loads(decoded)
+
         return service_account.Credentials.from_service_account_info(
             info,
             scopes=DRIVE_READONLY_SCOPE,
         )
 
-    # Fallback untuk pengembangan lokal.
     local_credentials = (
         Path(__file__).resolve().parent.parent
         / "google-service-account.json"
@@ -60,10 +68,7 @@ def get_drive_credentials():
 
 
 def download_scorecard_excel(file_id=None):
-    """
-    Mengunduh Excel dan mengembalikan metadata, isi file, dan SHA-256.
-    Fungsi ini tidak mengakses atau mengubah database.
-    """
+    """Mengunduh file Excel dari Google Drive tanpa mengubah database."""
 
     resolved_file_id = (
         file_id or os.getenv("GOOGLE_DRIVE_SCORECARD_FILE_ID")
@@ -71,6 +76,7 @@ def download_scorecard_excel(file_id=None):
 
     if not resolved_file_id:
         raise RuntimeError(
+            "File ID tidak diberikan dan "
             "GOOGLE_DRIVE_SCORECARD_FILE_ID belum dikonfigurasi."
         )
 
@@ -94,20 +100,19 @@ def download_scorecard_excel(file_id=None):
 
     mime_type = metadata.get("mimeType", "")
 
-    if mime_type != (
-        "application/vnd.openxmlformats-officedocument."
-        "spreadsheetml.sheet"
-    ):
+    if mime_type != XLSX_MIME_TYPE:
         raise ValueError(
-            "File Google Drive bukan file Excel .xlsx yang didukung: "
-            f"{mime_type}"
+            "File Google Drive bukan file Excel .xlsx yang didukung. "
+            f"MIME type: {mime_type or 'tidak diketahui'}"
         )
 
     request = drive.files().get_media(fileId=resolved_file_id)
+
     buffer = BytesIO()
     downloader = MediaIoBaseDownload(buffer, request)
 
     done = False
+
     while not done:
         _, done = downloader.next_chunk()
 
@@ -129,6 +134,21 @@ def download_scorecard_excel(file_id=None):
     }
 
 
+def _build_source_path(file_id, sales_office, report_period):
+    """
+    Membuat identitas unik sumber berdasarkan file, kantor, dan periode.
+
+    File yang sama dapat digunakan untuk periode berbeda tanpa membuat
+    status sinkronisasi satu periode memengaruhi periode lainnya.
+    """
+
+    return (
+        f"google-drive:{file_id}"
+        f":office={sales_office}"
+        f":period={report_period}"
+    )
+
+
 def sync_scorecard_from_drive(
     sales_office,
     report_period,
@@ -137,23 +157,104 @@ def sync_scorecard_from_drive(
     db_client=None,
     downloader=None,
 ):
-    """Validasi dan sinkronkan workbook Drive; dry-run tidak menulis DB."""
-    configured_office = os.getenv("SCORECARD_SALES_OFFICE", "").strip()
-    configured_period = os.getenv("SCORECARD_REPORT_PERIOD", "").strip()
-    if configured_office and sales_office.strip() != configured_office:
-        raise ValueError("sales_office tidak sesuai dengan konfigurasi sumber Drive.")
-    if configured_period and report_period != configured_period:
-        raise ValueError("report_period tidak sesuai dengan konfigurasi sumber Drive.")
+    """
+    Memvalidasi atau menyinkronkan Scorecard dari Google Drive.
 
-    client = db_client or supabase
+    dry_run=True:
+        Mengunduh dan memvalidasi file.
+        Tidak melakukan query atau penulisan database.
+
+    dry_run=False:
+        Memvalidasi file, memeriksa hash per periode, mengimpor data,
+        dan memperbarui status sinkronisasi.
+    """
+
+    configured_office = os.getenv(
+        "SCORECARD_SALES_OFFICE", ""
+    ).strip()
+
+    sales_office = str(sales_office).strip()
+    report_period = str(report_period).strip()
+
+    if not sales_office:
+        raise ValueError("sales_office tidak boleh kosong.")
+
+    if not report_period:
+        raise ValueError("report_period tidak boleh kosong.")
+
+    if configured_office and sales_office != configured_office:
+        raise ValueError(
+            "sales_office tidak sesuai dengan konfigurasi "
+            "sumber Drive."
+        )
+
+    if file_id is not None:
+        file_id = file_id.strip()
+
+        if not file_id:
+            raise ValueError("file_id tidak boleh kosong.")
+
+    # Klien database tidak digunakan dalam jalur dry-run.
+    client = db_client if db_client is not None else supabase
     fetch_file = downloader or download_scorecard_excel
-    source_path = f"google-drive:{file_id or os.getenv('GOOGLE_DRIVE_SCORECARD_FILE_ID', '')}"
+
+    resolved_file_id = (
+        file_id
+        or os.getenv("GOOGLE_DRIVE_SCORECARD_FILE_ID", "")
+    )
+
+    source_path = _build_source_path(
+        resolved_file_id,
+        sales_office,
+        report_period,
+    )
+
+    remote = {}
 
     try:
+        # 1. Unduh file dari Google Drive.
         remote = fetch_file(file_id=file_id)
-        source_path = f"google-drive:{remote['file_id']}"
 
-        # SELECT ini hanya membaca hash terakhir untuk deteksi perubahan.
+        actual_file_id = remote.get("file_id")
+
+        if not actual_file_id:
+            raise ValueError(
+                "Downloader tidak mengembalikan file_id."
+            )
+
+        # 2. Identitas sumber dipisahkan berdasarkan periode.
+        source_path = _build_source_path(
+            actual_file_id,
+            sales_office,
+            report_period,
+        )
+
+        # 3. Validasi workbook selalu dilakukan terlebih dahulu.
+        validation = import_scorecard_excel(
+            file_bytes=remote["file_bytes"],
+            sales_office=sales_office,
+            report_period=report_period,
+            source_file=remote["file_name"],
+            dry_run=True,
+        )
+
+        # 4. Dry-run berhenti di sini tanpa query atau penulisan DB.
+        if dry_run:
+            return {
+                **validation,
+                "message": (
+                    "Validasi berhasil. Tidak ada perubahan database."
+                ),
+                "dry_run": True,
+                "changed": None,
+                "sha256": remote["sha256"],
+                "file_id": actual_file_id,
+                "file_name": remote["file_name"],
+                "report_period": report_period,
+                "sync_status": "validation_only",
+            }
+
+        # 5. Periksa hash khusus untuk file + kantor + periode ini.
         source_rows = (
             client.table("scorecard_sources")
             .select("last_file_hash,sync_status")
@@ -163,69 +264,99 @@ def sync_scorecard_from_drive(
             .data
             or []
         )
-        previous_hash = source_rows[0].get("last_file_hash") if source_rows else None
+
+        previous_hash = (
+            source_rows[0].get("last_file_hash")
+            if source_rows
+            else None
+        )
+
+        previous_status = (
+            source_rows[0].get("sync_status")
+            if source_rows
+            else None
+        )
+
         if (
             previous_hash == remote["sha256"]
-            and source_rows[0].get("sync_status") == "synced"
+            and previous_status == "synced"
         ):
             return {
-                "message": "File tidak berubah; sinkronisasi dilewati",
+                "message": (
+                    "File tidak berubah untuk periode ini; "
+                    "sinkronisasi dilewati."
+                ),
                 "changed": False,
-                "dry_run": dry_run,
+                "dry_run": False,
+                "file_id": actual_file_id,
                 "file_name": remote["file_name"],
                 "sha256": remote["sha256"],
-                "sync_status": source_rows[0].get("sync_status", "synced"),
+                "sales_office": sales_office,
+                "report_period": report_period,
+                "sync_status": "synced",
             }
 
-        validation = import_scorecard_excel(
-            file_bytes=remote["file_bytes"],
-            sales_office=sales_office,
-            report_period=report_period,
-            source_file=remote["file_name"],
-            dry_run=True,
-        )
-        if dry_run:
-            return {
-                **validation,
-                "changed": True,
-                "sha256": remote["sha256"],
-                "file_name": remote["file_name"],
-                "sync_status": "pending",
-            }
-
+        # 6. Impor nyata hanya setelah validasi berhasil.
         imported = import_scorecard_excel(
             file_bytes=remote["file_bytes"],
             sales_office=sales_office,
             report_period=report_period,
             source_file=remote["file_name"],
         )
+
+        # 7. Catat status sumber setelah impor berhasil.
         _write_source_status(
-            client, sales_office, report_period, remote,
-            source_path, "synced", None,
+            client=client,
+            sales_office=sales_office,
+            report_period=report_period,
+            remote=remote,
+            source_path=source_path,
+            status="synced",
+            error=None,
         )
+
         return {
             **imported,
             "changed": True,
-            "sha256": remote["sha256"],
+            "dry_run": False,
+            "file_id": actual_file_id,
             "file_name": remote["file_name"],
+            "sha256": remote["sha256"],
+            "sales_office": sales_office,
+            "report_period": report_period,
             "sync_status": "synced",
         }
+
     except Exception as exc:
+        # Catat error hanya pada sinkronisasi nyata.
         if not dry_run:
             try:
                 _write_source_status(
-                    client, sales_office, report_period,
-                    locals().get("remote", {}), source_path, "error", str(exc),
+                    client=client,
+                    sales_office=sales_office,
+                    report_period=report_period,
+                    remote=remote,
+                    source_path=source_path,
+                    status="error",
+                    error=str(exc),
                 )
             except Exception:
+                # Jangan menutupi error utama dengan error pencatatan.
                 pass
+
         raise
 
 
 def _write_source_status(
-    client, sales_office, report_period, remote, source_path, status, error
+    client,
+    sales_office,
+    report_period,
+    remote,
+    source_path,
+    status,
+    error,
 ):
-    from datetime import datetime, timezone
+    """Menyimpan status sumber untuk file dan periode tertentu."""
 
     row = {
         "source_name": "Google Drive Scorecard",
@@ -237,10 +368,16 @@ def _write_source_status(
         "sync_status": status,
         "last_error": error,
     }
+
     if remote.get("sha256"):
         row["last_file_hash"] = remote["sha256"]
+
     if status == "synced":
-        row["last_synced_at"] = datetime.now(timezone.utc).isoformat()
+        row["last_synced_at"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+
     client.table("scorecard_sources").upsert(
-        row, on_conflict="source_path"
+        row,
+        on_conflict="source_path",
     ).execute()
