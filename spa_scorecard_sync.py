@@ -1,4 +1,3 @@
-
 """Central Sync Agent untuk SPA Scorecard.
 
 Backend mengambil workbook langsung dari Google Drive API.
@@ -39,11 +38,15 @@ LOG = logging.getLogger("spa_scorecard_sync")
 DEFAULT_POLL_INTERVAL = 60
 MIN_POLL_INTERVAL = 15
 HTTP_TIMEOUT = 120
+MAX_ERROR_BODY_LENGTH = 2000
 
 
 def auto_sync_enabled() -> bool:
     """Sinkronisasi harus diaktifkan secara eksplisit."""
-    value = os.getenv("SCORECARD_AUTO_SYNC", "false").strip().lower()
+    value = os.getenv(
+        "SCORECARD_AUTO_SYNC",
+        "false",
+    ).strip().lower()
 
     if value in {"true", "1", "yes", "on"}:
         return True
@@ -80,10 +83,16 @@ def normalize_backend_url(value: str) -> str:
         or parsed.query
         or parsed.fragment
     ):
-        raise RuntimeError("SCORECARD_BACKEND_URL tidak valid.")
+        raise RuntimeError(
+            "SCORECARD_BACKEND_URL tidak valid."
+        )
 
     hostname = parsed.hostname.lower()
-    is_localhost = hostname in {"127.0.0.1", "::1", "localhost"}
+    is_localhost = hostname in {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }
 
     if parsed.scheme == "http" and not is_localhost:
         raise RuntimeError(
@@ -98,7 +107,13 @@ def normalize_backend_url(value: str) -> str:
         path = path[:-4].rstrip("/")
 
     return urlunsplit(
-        (parsed.scheme, parsed.netloc, path, "", "")
+        (
+            parsed.scheme,
+            parsed.netloc,
+            path,
+            "",
+            "",
+        )
     ).rstrip("/")
 
 
@@ -107,6 +122,7 @@ def read_config() -> dict:
     backend_url = normalize_backend_url(
         required_env("SCORECARD_BACKEND_URL")
     )
+
     token = required_env("SCORECARD_IMPORT_TOKEN")
     sales_office = required_env("SCORECARD_SALES_OFFICE")
     report_period = required_env("SCORECARD_REPORT_PERIOD")
@@ -152,9 +168,28 @@ def read_config() -> dict:
     }
 
 
+def _read_http_error(exc: HTTPError) -> str:
+    """Baca respons error tanpa menampilkan header atau token."""
+    try:
+        body = exc.read(
+            MAX_ERROR_BODY_LENGTH + 1
+        ).decode(
+            "utf-8",
+            errors="replace",
+        )
+    except Exception:
+        return "Body respons error tidak dapat dibaca."
+
+    if len(body) > MAX_ERROR_BODY_LENGTH:
+        body = body[:MAX_ERROR_BODY_LENGTH] + "... (dipotong)"
+
+    return body or "Backend tidak memberikan detail error."
+
+
 def sync_from_drive(config: dict) -> dict:
     """Minta backend memeriksa dan menyinkronkan workbook Google Drive.
 
+    PERHATIAN:
     dry_run=false mengizinkan perubahan database jika workbook berubah
     dan proses validasi serta impor berhasil.
     """
@@ -182,7 +217,10 @@ def sync_from_drive(config: dict) -> dict:
     )
 
     try:
-        with urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        with urlopen(
+            request,
+            timeout=HTTP_TIMEOUT,
+        ) as response:
             status = response.status
             response_text = response.read().decode(
                 "utf-8",
@@ -190,18 +228,35 @@ def sync_from_drive(config: dict) -> dict:
             )
 
     except HTTPError as exc:
+        error_body = _read_http_error(exc)
+
+        LOG.error(
+            "Backend sync gagal | HTTP %s | detail=%s",
+            exc.code,
+            error_body,
+        )
+
         raise RuntimeError(
             f"Backend menolak permintaan sinkronisasi "
-            f"(HTTP {exc.code})."
+            f"(HTTP {exc.code}). "
+            f"Detail: {error_body}"
         ) from exc
 
     except URLError as exc:
         reason = getattr(exc, "reason", None)
 
-        if isinstance(reason, (TimeoutError, SocketTimeout)):
+        if isinstance(
+            reason,
+            (TimeoutError, SocketTimeout),
+        ):
             raise RuntimeError(
                 "Koneksi ke backend melewati batas waktu."
             ) from exc
+
+        LOG.error(
+            "Backend tidak dapat dihubungi | alasan=%s",
+            str(reason)[:300],
+        )
 
         raise RuntimeError(
             "Backend tidak dapat dihubungi. "
@@ -221,6 +276,9 @@ def sync_from_drive(config: dict) -> dict:
     try:
         result = json.loads(response_text)
     except json.JSONDecodeError as exc:
+        LOG.error(
+            "Backend memberikan respons JSON tidak valid."
+        )
         raise RuntimeError(
             "Respons backend bukan JSON yang valid."
         ) from exc
@@ -239,12 +297,17 @@ def log_sync_result(result: dict) -> None:
         "message",
         "Respons backend diterima",
     )
+
     changed = result.get("changed")
     dry_run = result.get("dry_run")
     sync_status = result.get("sync_status")
     file_name = result.get("file_name")
 
-    LOG.info("Hasil: %s", str(message)[:250])
+    LOG.info(
+        "Hasil: %s",
+        str(message)[:250],
+    )
+
     LOG.info(
         "changed=%s | dry_run=%s | sync_status=%s",
         changed,
@@ -253,17 +316,20 @@ def log_sync_result(result: dict) -> None:
     )
 
     if isinstance(file_name, str) and file_name:
-        LOG.info("File Drive: %s", file_name[:250])
+        LOG.info(
+            "File Drive: %s",
+            file_name[:250],
+        )
 
     if dry_run is True:
-        LOG.error(
+        LOG.warning(
             "Backend melaporkan dry-run. "
             "Perubahan database tidak dikonfirmasi."
         )
-    elif changed is False:
+    elif changed is False and sync_status == "synced":
         LOG.info(
-            "Backend menyatakan file tidak berubah berdasarkan "
-            "pemeriksaan yang dilakukan."
+            "File tidak berubah dan status sinkronisasi sebelumnya "
+            "dikonfirmasi synced."
         )
     elif sync_status == "synced":
         LOG.info(
@@ -277,6 +343,7 @@ def log_sync_result(result: dict) -> None:
 
 
 def run() -> None:
+    """Jalankan agent jika sakelar otomatis diaktifkan."""
     # Periksa sakelar sebelum membaca konfigurasi atau mengakses jaringan.
     if not auto_sync_enabled():
         LOG.info(
@@ -292,6 +359,7 @@ def run() -> None:
         "Central Sync Agent aktif. "
         "Permintaan sinkronisasi nyata diizinkan."
     )
+
     LOG.info(
         "Backend=%s | office=%s | period=%s | interval=%ss",
         config["backend_url"],
@@ -299,6 +367,7 @@ def run() -> None:
         config["report_period"],
         config["poll_interval"],
     )
+
     LOG.info(
         "Workbook dibaca backend melalui Google Drive API; "
         "agent tidak membaca Excel lokal."
@@ -319,8 +388,9 @@ def run() -> None:
         except Exception as exc:
             LOG.error(
                 "Pemeriksaan sinkronisasi gagal: %s",
-                str(exc)[:300],
+                str(exc)[:MAX_ERROR_BODY_LENGTH],
             )
+
             LOG.info(
                 "Agent akan mencoba kembali pada interval berikutnya."
             )
@@ -341,7 +411,7 @@ if __name__ == "__main__":
         run()
 
     except KeyboardInterrupt:
-        LOG.info("Central Sync Agent dihentikan.")
+        LOG.info("Agent dihentikan oleh pengguna.")
 
     except Exception as exc:
         LOG.error(
