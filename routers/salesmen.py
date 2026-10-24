@@ -12,10 +12,18 @@ from services.salesmen_service import (
 )
 from services.scorecard_service import get_scorecard_productivity
 
+
 router = APIRouter(
     prefix="/api/salesmen",
     tags=["Salesmen Performance"],
 )
+
+
+def normalize_salesman_name(value):
+    """Normalisasi nama untuk pencocokan data SUMM."""
+    return " ".join(
+        str(value or "").strip().casefold().split()
+    )
 
 
 @router.get("/")
@@ -58,9 +66,9 @@ def read_salesman_performance(
         )
 
     sales_data = results[0]
-    sales_npk = str(sales_data.get("npk", "")).strip()
 
-    # Ambil histori SUMM untuk salesman dan periode yang dipilih.
+    # Ambil histori SUMM berdasarkan office, group, nama, dan periode.
+    # NPK SUMM tidak harus sama dengan NPK Produktifitas.
     summ_rows = get_salesman_summ(
         office=office,
         group=group,
@@ -68,18 +76,26 @@ def read_salesman_performance(
         report_period=report_period.isoformat(),
     )
 
-    # Cocokkan berdasarkan NPK, bukan nama saja.
-    summ_data = next(
-        (
-            row
-            for row in summ_rows
-            if str(row.get("npk", "")).strip() == sales_npk
-        ),
-        None,
+    normalized_name = normalize_salesman_name(
+        sales_data.get("nama")
+    )
+
+    matching_summ_rows = [
+        row
+        for row in summ_rows
+        if normalize_salesman_name(row.get("nama"))
+        == normalized_name
+    ]
+
+    # Jangan memilih secara sembarangan jika nama tidak unik.
+    summ_data = (
+        matching_summ_rows[0]
+        if len(matching_summ_rows) == 1
+        else None
     )
 
     # Nilai default berasal dari Scorecard lama.
-    # Nilai ini tetap dipakai jika SUMM periode tersebut tidak ditemukan.
+    # Tetap digunakan jika SUMM untuk periode ini tidak ditemukan.
     targets = sales_data.get("targets") or []
     target_info = targets[0] if targets else {}
 
@@ -89,60 +105,78 @@ def read_salesman_performance(
     pillar_3 = float(target_info.get("pilar_process", 2.0))
 
     status_grade = (
-        "HIGH" if score >= 11
-        else "MEDIUM" if score >= 9
+        "HIGH"
+        if score >= 11
+        else "MEDIUM"
+        if score >= 9
         else "LOW"
     )
 
-    # None berarti SUMM tidak ditemukan, sehingga scorecard lama dipakai.
+    # None berarti SUMM tidak ditemukan.
     summ_scorecard = None
 
     if summ_data is not None:
         strategic = summ_data.get("strategic_alignment") or {}
 
-        # Nilai akhir dan status mengikuti data SUMM.
+        # Final grade dan status menggunakan data SUMM.
         score = float(summ_data.get("final_grade", 0))
         status_grade = str(
             summ_data.get("final_score") or "LOW"
         ).upper()
 
-        # Breakdown tiga pilar SUMM.
+        # Breakdown tiga pilar dari SUMM.
         pillar_1 = float(
             summ_data.get("result_sales_achiev_gr", 0)
         )
+
         pillar_2 = (
             float(strategic.get("cross_up_sell", 0))
             + float(strategic.get("active_outlet", 0))
             + float(strategic.get("repeat_order", 0))
         )
-        pillar_3 = float(strategic.get("process_dks", 0))
 
-        # Lima indikator SUMM.
+        pillar_3 = float(
+            strategic.get("process_dks", 0)
+        )
+
+        # Lima indikator SUMM untuk ditampilkan di frontend.
         summ_scorecard = [
             {
                 "value": str(
-                    float(summ_data.get("result_sales_achiev_gr", 0))
+                    float(
+                        summ_data.get(
+                            "result_sales_achiev_gr", 0
+                        )
+                    )
                 ),
                 "aspect": "RESULT",
                 "indicator": "Sales Achievement & Growth",
             },
             {
-                "value": str(float(strategic.get("cross_up_sell", 0))),
+                "value": str(
+                    float(strategic.get("cross_up_sell", 0))
+                ),
                 "aspect": "STRATEGIC ALIGNMENT",
                 "indicator": "Cross Selling - Up Selling",
             },
             {
-                "value": str(float(strategic.get("active_outlet", 0))),
+                "value": str(
+                    float(strategic.get("active_outlet", 0))
+                ),
                 "aspect": "STRATEGIC ALIGNMENT",
                 "indicator": "Active Outlet (OA)",
             },
             {
-                "value": str(float(strategic.get("repeat_order", 0))),
+                "value": str(
+                    float(strategic.get("repeat_order", 0))
+                ),
                 "aspect": "STRATEGIC ALIGNMENT",
                 "indicator": "Repeat Order",
             },
             {
-                "value": str(float(strategic.get("process_dks", 0))),
+                "value": str(
+                    float(strategic.get("process_dks", 0))
+                ),
                 "aspect": "PROCESS",
                 "indicator": "DKS (Daftar Kunjungan Sales)",
             },
@@ -152,21 +186,24 @@ def read_salesman_performance(
         "sales_office",
         "S001 - SO SERANG",
     )
+
     office_name = (
         office_raw.split(" - ")[-1].replace("SO ", "")
         if " - " in office_raw
         else office_raw
     )
 
-    # Ambil matriks produktivitas dari Excel untuk office dan periode
-    # yang sama. Sheet Produktifitas tetap dipertahankan.
+    # Sheet Produktifitas tetap dipertahankan.
     try:
         productivity_rows = get_scorecard_productivity(
-            sales_office=sales_data.get("sales_office", office),
+            sales_office=sales_data.get(
+                "sales_office",
+                office,
+            ),
             report_period=report_period.isoformat(),
         )
 
-        # Hilangkan baris ringkasan HIGH, MEDIUM, LOW yang bukan karyawan.
+        # Hilangkan baris ringkasan HIGH, MEDIUM, LOW.
         productivity_rows = [
             row
             for row in (productivity_rows or [])
@@ -193,7 +230,10 @@ def read_salesman_performance(
             "totalOutlet": (
                 f"{target_info.get('total_outlet', 30)} Outlet Aktif"
             ),
-            "rankSo": target_info.get("rank_so", "#1 dari 18 Sales"),
+            "rankSo": target_info.get(
+                "rank_so",
+                "#1 dari 18 Sales",
+            ),
             "avgAchievement": target_info.get(
                 "avg_achievement",
                 "70.0%",
@@ -215,26 +255,37 @@ def read_salesman_performance(
             "pilar3": pillar_3,
         },
 
-        # Gunakan scorecard SUMM jika tersedia.
-        # Jika tidak, pertahankan scorecard lama.
+        # Field baru khusus lima indikator SUMM.
+        "summScorecard": summ_scorecard or [],
+
+        # Pertahankan scorecard lama untuk kompatibilitas.
         "scorecard": (
             summ_scorecard
             if summ_scorecard is not None
             else sales_data.get("scorecard", [])
         ),
 
-        # Produktivitas tetap diambil dari Excel seperti sebelumnya.
+        # Produktifitas tetap berasal dari sheet Produktifitas.
         "productivityScorecard": {
-            "salesOffice": sales_data.get("sales_office", office),
+            "salesOffice": sales_data.get(
+                "sales_office",
+                office,
+            ),
             "reportPeriod": report_period.isoformat(),
             "count": len(productivity_rows),
             "data": productivity_rows,
         },
 
-        # Properti lama lainnya tidak diubah.
+        # Properti lama lainnya tetap dipertahankan.
         "trackRecord": sales_data.get("trackRecord", []),
-        "repeatOrderRendah": sales_data.get("repeatOrderRendah", []),
-        "kekuatanSales": sales_data.get("kekuatanSales", []),
+        "repeatOrderRendah": sales_data.get(
+            "repeatOrderRendah",
+            [],
+        ),
+        "kekuatanSales": sales_data.get(
+            "kekuatanSales",
+            [],
+        ),
         "catatanSupervisor": sales_data.get(
             "catatanSupervisor",
             "",
@@ -271,6 +322,7 @@ def get_salesman_stores(npk: str):
         )
 
         stores = stores_response.data or []
+
         customer_codes = [
             store["cust_no"]
             for store in stores
