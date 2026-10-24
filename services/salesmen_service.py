@@ -3,7 +3,11 @@ from database import supabase
 
 
 def get_all_salesmen():
-    response = supabase.table("salesmen").select("*").execute()
+    response = (
+        supabase.table("salesmen")
+        .select("*")
+        .execute()
+    )
     return response.data or []
 
 
@@ -44,13 +48,22 @@ def get_salesman_performance(
     query = supabase.table("salesmen").select("*, targets(*)")
 
     if salesman and salesman.strip():
-        query = query.ilike("nama", f"%{salesman.strip()}%")
+        query = query.ilike(
+            "nama",
+            f"%{salesman.strip()}%",
+        )
 
     if office and office.strip():
-        query = query.eq("sales_office", office.strip())
+        query = query.eq(
+            "sales_office",
+            office.strip(),
+        )
 
     if group and group.strip():
-        query = query.eq("grup_product", group.strip())
+        query = query.eq(
+            "grup_product",
+            group.strip(),
+        )
 
     response = query.execute()
     return response.data or []
@@ -62,18 +75,33 @@ def get_salesman_summ(
     salesman: str | None = None,
     report_period: str | None = None,
 ):
+    """
+    Mengambil data SUMM dari salesmen.summ_history.
+
+    Histori SUMM disimpan per report_period dan sales office.
+    Fungsi ini hanya membaca database, tidak mengubah data.
+    """
     query = supabase.table("salesmen").select(
         "npk, nama, sales_office, grup_product, summ_history"
     )
 
     if salesman and salesman.strip():
-        query = query.ilike("nama", f"%{salesman.strip()}%")
+        query = query.ilike(
+            "nama",
+            f"%{salesman.strip()}%",
+        )
 
     if office and office.strip():
-        query = query.eq("sales_office", office.strip())
+        query = query.eq(
+            "sales_office",
+            office.strip(),
+        )
 
     if group and group.strip():
-        query = query.eq("grup_product", group.strip())
+        query = query.eq(
+            "grup_product",
+            group.strip(),
+        )
 
     response = query.execute()
     rows = response.data or []
@@ -86,20 +114,33 @@ def get_salesman_summ(
         if not isinstance(history, dict):
             continue
 
-        for key, entry in history.items():
+        for _, entry in history.items():
             if not isinstance(entry, dict):
                 continue
 
-            if report_period and entry.get("report_period") != report_period:
+            # Filter berdasarkan periode laporan.
+            if (
+                report_period
+                and str(entry.get("report_period", "")).strip()
+                != str(report_period).strip()
+            ):
                 continue
 
-            if office and entry.get("sales_office") != office.strip():
+            # Pastikan kantor dalam histori sesuai filter.
+            if office and (
+                str(entry.get("sales_office", "")).strip()
+                != office.strip()
+            ):
                 continue
 
             results.append({
                 **entry,
                 "npk": entry.get("npk") or row.get("npk"),
                 "nama": entry.get("nama") or row.get("nama"),
+                "sales_office": (
+                    entry.get("sales_office")
+                    or row.get("sales_office")
+                ),
                 "grup_product": row.get("grup_product"),
             })
 
