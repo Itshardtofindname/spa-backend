@@ -1,3 +1,4 @@
+
 from datetime import date
 
 from database import supabase
@@ -7,6 +8,7 @@ from services.salesmen_service import (
     get_all_salesmen,
     get_filter_options,
     get_salesman_performance,
+    get_salesman_summ,
 )
 from services.scorecard_service import get_scorecard_productivity
 
@@ -33,6 +35,7 @@ def read_salesman_performance(
     salesman: str = Query(..., min_length=1),
     report_period: date = Query(default=date(2026, 9, 1)),
 ):
+    # Ambil data utama salesman dari tabel salesmen dan targets.
     results = get_salesman_performance(
         office=office,
         group=group,
@@ -55,6 +58,28 @@ def read_salesman_performance(
         )
 
     sales_data = results[0]
+    sales_npk = str(sales_data.get("npk", "")).strip()
+
+    # Ambil histori SUMM untuk salesman dan periode yang dipilih.
+    summ_rows = get_salesman_summ(
+        office=office,
+        group=group,
+        salesman=sales_data.get("nama"),
+        report_period=report_period.isoformat(),
+    )
+
+    # Cocokkan berdasarkan NPK, bukan nama saja.
+    summ_data = next(
+        (
+            row
+            for row in summ_rows
+            if str(row.get("npk", "")).strip() == sales_npk
+        ),
+        None,
+    )
+
+    # Nilai default berasal dari Scorecard lama.
+    # Nilai ini tetap dipakai jika SUMM periode tersebut tidak ditemukan.
     targets = sales_data.get("targets") or []
     target_info = targets[0] if targets else {}
 
@@ -63,29 +88,85 @@ def read_salesman_performance(
     pillar_2 = float(target_info.get("pilar_strategic", 5.0))
     pillar_3 = float(target_info.get("pilar_process", 2.0))
 
-    office_raw = sales_data.get("sales_office", "S001 - SO SERANG")
-    office_name = (
-        office_raw.split(" - ")[-1].replace("SO ", "")
-        if " - " in office_raw
-        else office_raw
-    )
-
     status_grade = (
         "HIGH" if score >= 11
         else "MEDIUM" if score >= 9
         else "LOW"
     )
 
+    # None berarti SUMM tidak ditemukan, sehingga scorecard lama dipakai.
+    summ_scorecard = None
+
+    if summ_data is not None:
+        strategic = summ_data.get("strategic_alignment") or {}
+
+        # Nilai akhir dan status mengikuti data SUMM.
+        score = float(summ_data.get("final_grade", 0))
+        status_grade = str(
+            summ_data.get("final_score") or "LOW"
+        ).upper()
+
+        # Breakdown tiga pilar SUMM.
+        pillar_1 = float(
+            summ_data.get("result_sales_achiev_gr", 0)
+        )
+        pillar_2 = (
+            float(strategic.get("cross_up_sell", 0))
+            + float(strategic.get("active_outlet", 0))
+            + float(strategic.get("repeat_order", 0))
+        )
+        pillar_3 = float(strategic.get("process_dks", 0))
+
+        # Lima indikator SUMM.
+        summ_scorecard = [
+            {
+                "value": str(
+                    float(summ_data.get("result_sales_achiev_gr", 0))
+                ),
+                "aspect": "RESULT",
+                "indicator": "Sales Achievement & Growth",
+            },
+            {
+                "value": str(float(strategic.get("cross_up_sell", 0))),
+                "aspect": "STRATEGIC ALIGNMENT",
+                "indicator": "Cross Selling - Up Selling",
+            },
+            {
+                "value": str(float(strategic.get("active_outlet", 0))),
+                "aspect": "STRATEGIC ALIGNMENT",
+                "indicator": "Active Outlet (OA)",
+            },
+            {
+                "value": str(float(strategic.get("repeat_order", 0))),
+                "aspect": "STRATEGIC ALIGNMENT",
+                "indicator": "Repeat Order",
+            },
+            {
+                "value": str(float(strategic.get("process_dks", 0))),
+                "aspect": "PROCESS",
+                "indicator": "DKS (Daftar Kunjungan Sales)",
+            },
+        ]
+
+    office_raw = sales_data.get(
+        "sales_office",
+        "S001 - SO SERANG",
+    )
+    office_name = (
+        office_raw.split(" - ")[-1].replace("SO ", "")
+        if " - " in office_raw
+        else office_raw
+    )
+
     # Ambil matriks produktivitas dari Excel untuk office dan periode
-    # yang sama. Data ini mencakup seluruh salesman di office tersebut.
+    # yang sama. Sheet Produktifitas tetap dipertahankan.
     try:
         productivity_rows = get_scorecard_productivity(
             sales_office=sales_data.get("sales_office", office),
             report_period=report_period.isoformat(),
         )
 
-        # NPK karyawan harus berupa angka. Baris ringkasan seperti
-        # HIGH, MEDIUM, dan LOW tidak ditampilkan sebagai karyawan.
+        # Hilangkan baris ringkasan HIGH, MEDIUM, LOW yang bukan karyawan.
         productivity_rows = [
             row
             for row in (productivity_rows or [])
@@ -134,10 +215,15 @@ def read_salesman_performance(
             "pilar3": pillar_3,
         },
 
-        # Data scorecard lama tetap dipertahankan.
-        "scorecard": sales_data.get("scorecard", []),
+        # Gunakan scorecard SUMM jika tersedia.
+        # Jika tidak, pertahankan scorecard lama.
+        "scorecard": (
+            summ_scorecard
+            if summ_scorecard is not None
+            else sales_data.get("scorecard", [])
+        ),
 
-        # Data produktivitas Excel yang baru.
+        # Produktivitas tetap diambil dari Excel seperti sebelumnya.
         "productivityScorecard": {
             "salesOffice": sales_data.get("sales_office", office),
             "reportPeriod": report_period.isoformat(),
@@ -145,6 +231,7 @@ def read_salesman_performance(
             "data": productivity_rows,
         },
 
+        # Properti lama lainnya tidak diubah.
         "trackRecord": sales_data.get("trackRecord", []),
         "repeatOrderRendah": sales_data.get("repeatOrderRendah", []),
         "kekuatanSales": sales_data.get("kekuatanSales", []),
