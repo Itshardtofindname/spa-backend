@@ -38,6 +38,31 @@ def normalize_npk(value):
     return text
 
 
+def normalize_salesman_name(value):
+    """
+    Menormalisasi nama untuk pencocokan master salesman.
+
+    Perbedaan huruf besar/kecil dan spasi berlebih tidak
+    menyebabkan salesman dianggap sebagai orang berbeda.
+    """
+    if value is None:
+        return ""
+
+    text = str(value).strip().casefold()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def normalize_sales_office(value):
+    """Menormalisasi nama sales office untuk pencocokan."""
+    if value is None:
+        return ""
+
+    text = str(value).strip().casefold()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
 def parse_summ_number(value):
     """Mengubah nilai indikator SUMM menjadi angka."""
     if value is None or isinstance(value, bool):
@@ -64,11 +89,8 @@ def _find_summ_headers(sheet):
     """
     Mencari dua baris header pada sheet SUMM.
 
-    Baris pertama dapat berisi kelompok indikator seperti RESULT,
-    STRATEGIC ALLIGNMENT, PROCESS, dan FINAL.
-
-    Baris berikutnya berisi nama kolom sebenarnya, seperti NPK,
-    NAMA, SALES ACHIEV & GR, CROSS - UP SELL, GRADE, dan SCORE.
+    Baris pertama dapat berisi kelompok indikator.
+    Baris berikutnya berisi nama kolom sebenarnya.
     """
     max_header_row = min(sheet.max_row or 0, 40)
 
@@ -87,7 +109,6 @@ def _find_summ_headers(sheet):
             else []
         )
 
-        # Periksa kedua baris, bukan hanya header yang sudah digabung.
         all_headers = set(current + next_row)
 
         has_npk = "npk" in all_headers
@@ -118,7 +139,6 @@ def _find_summ_headers(sheet):
             continue
 
         columns = {}
-
         max_columns = max(len(current), len(next_row))
 
         for index in range(max_columns):
@@ -133,8 +153,7 @@ def _find_summ_headers(sheet):
                 else ""
             )
 
-            # Prioritaskan baris kedua karena berisi nama indikator
-            # yang sebenarnya. Gunakan baris pertama sebagai fallback.
+            # Prioritaskan baris kedua yang berisi nama indikator.
             selected_header = second_value or first_value
 
             if selected_header:
@@ -191,10 +210,7 @@ def _extract_summ_records(
         header_row, columns = _find_summ_headers(sheet)
 
         column_map = {
-            "npk": _get_summ_column(
-                columns,
-                ["npk"],
-            ),
+            "npk": _get_summ_column(columns, ["npk"]),
             "nama": _get_summ_column(
                 columns,
                 ["nama", "salesman"],
@@ -255,10 +271,11 @@ def _extract_summ_records(
 
         records_by_npk = {}
         duplicate_npks = set()
+        identities_seen = set()
+        duplicate_identities = set()
         skipped_rows = 0
 
-        # Pada workbook saat ini, baris pertama data berada
-        # dua baris setelah baris kelompok header.
+        # Data dimulai dua baris setelah baris kelompok header.
         for row in sheet.iter_rows(
             min_row=header_row + 2,
             values_only=True,
@@ -348,7 +365,7 @@ def _extract_summ_records(
                 grade_value,
             ]
 
-            # Abaikan baris yang memang belum mempunyai nilai SUMM.
+            # Abaikan baris yang belum memiliki nilai SUMM.
             if (
                 all(value is None for value in metric_values)
                 and not final_score
@@ -356,7 +373,6 @@ def _extract_summ_records(
                 skipped_rows += 1
                 continue
 
-            # Jangan menyimpan nilai parsial sebagai data lengkap.
             if grade_value is None or not final_score:
                 raise ValueError(
                     f"Grade atau score SUMM kosong untuk "
@@ -391,12 +407,31 @@ def _extract_summ_records(
                 duplicate_npks.add(npk)
                 continue
 
+            # Cegah dua baris dengan nama dan office yang sama
+            # memperbarui master yang sama secara tidak sengaja.
+            identity = (
+                normalize_salesman_name(nama),
+                normalize_sales_office(sales_office),
+            )
+
+            if identity in identities_seen:
+                duplicate_identities.add(nama)
+                continue
+
+            identities_seen.add(identity)
             records_by_npk[npk] = record
 
         if duplicate_npks:
             raise ValueError(
                 "Impor SUMM dibatalkan karena NPK duplikat: "
                 + ", ".join(sorted(duplicate_npks))
+            )
+
+        if duplicate_identities:
+            raise ValueError(
+                "Impor SUMM dibatalkan karena terdapat nama "
+                "salesman berulang pada sales office yang sama: "
+                + ", ".join(sorted(duplicate_identities))
             )
 
         records = list(records_by_npk.values())
@@ -412,6 +447,82 @@ def _extract_summ_records(
         workbook.close()
 
 
+def _get_salesmen_master(client):
+    """
+    Mengambil master salesman untuk pencocokan.
+
+    Kolom id dipakai sebagai kunci update agar pembaruan
+    tidak mengenai beberapa baris dengan NPK yang sama.
+    """
+    response = (
+        client.table("salesmen")
+        .select(
+            "id,npk,nama,sales_office,grup_product,summ_history"
+        )
+        .execute()
+    )
+
+    return response.data or []
+
+
+def _find_matching_salesman(master_rows, record):
+    """
+    Mencari satu master salesman berdasarkan nama dan office.
+
+    NPK dari SUMM bukan kunci utama karena dapat berbeda
+    dari NPK master Productivity.
+    """
+    target_name = normalize_salesman_name(record["nama"])
+    target_office = normalize_sales_office(
+        record["sales_office"]
+    )
+
+    matches = [
+        row
+        for row in master_rows
+        if normalize_salesman_name(row.get("nama"))
+        == target_name
+        and normalize_sales_office(row.get("sales_office"))
+        == target_office
+    ]
+
+    if len(matches) > 1:
+        raise ValueError(
+            "Ditemukan lebih dari satu master salesman untuk "
+            f"{record['nama']} di {record['sales_office']}. "
+            "Impor dibatalkan agar histori tidak salah masuk."
+        )
+
+    if matches:
+        return matches[0]
+
+    # Tidak ada nama + office yang cocok.
+    # Jangan insert jika NPK SUMM sudah dipakai master lain.
+    target_npk = normalize_npk(record["npk"])
+
+    npk_matches = [
+        row
+        for row in master_rows
+        if normalize_npk(row.get("npk")) == target_npk
+    ]
+
+    if npk_matches:
+        details = ", ".join(
+            f"{row.get('nama')} "
+            f"(NPK {row.get('npk')}, "
+            f"office {row.get('sales_office')})"
+            for row in npk_matches
+        )
+
+        raise ValueError(
+            f"NPK SUMM {target_npk} untuk {record['nama']} "
+            "sudah digunakan oleh master salesman lain: "
+            f"{details}. Tidak ada data yang diubah."
+        )
+
+    return None
+
+
 def import_salesman_summ_excel(
     file_bytes,
     sales_office,
@@ -423,12 +534,17 @@ def import_salesman_summ_excel(
     """
     Impor sheet SUMM ke salesmen.summ_history.
 
-    Key histori:
+    Kunci histori:
         YYYY-MM-DD|SALES OFFICE
 
-    Histori periode lain dipertahankan.
-    Data master salesman yang sudah ada tidak ditimpa,
-    kecuali kolom summ_history.
+    Aturan:
+    - Master dicocokkan berdasarkan nama + sales office.
+    - NPK master tidak diganti oleh NPK dari SUMM.
+    - NPK SUMM disimpan di dalam entri histori.
+    - Periode yang sama diperbarui/ditimpa.
+    - Histori periode lain dipertahankan.
+    - Master baru hanya dibuat jika tidak ditemukan pasangan
+      nama + office dan NPK SUMM belum dipakai master lain.
     """
     sales_office = str(sales_office or "").strip()
     report_period = str(report_period or "").strip()
@@ -473,23 +589,20 @@ def import_salesman_summ_excel(
     client = db_client if db_client is not None else supabase
     history_key = f"{report_period}|{sales_office}"
 
+    # Ambil master sekali agar pencocokan konsisten sepanjang impor.
+    master_rows = _get_salesmen_master(client)
+
     inserted = 0
     updated = 0
 
     for record in records:
-        existing_rows = (
-            client.table("salesmen")
-            .select(
-                "npk,nama,sales_office,grup_product,summ_history"
-            )
-            .eq("npk", record["npk"])
-            .limit(1)
-            .execute()
-            .data
-            or []
+        existing = _find_matching_salesman(
+            master_rows,
+            record,
         )
 
         history_entry = {
+            # Ini NPK dari file SUMM, bukan pengganti NPK master.
             "npk": record["npk"],
             "nama": record["nama"],
             "sales_office": sales_office,
@@ -506,49 +619,83 @@ def import_salesman_summ_excel(
             "updated_at": record["updated_at"],
         }
 
-        if existing_rows:
-            existing = existing_rows[0]
+        if existing:
             history = existing.get("summ_history") or {}
 
             if not isinstance(history, dict):
                 raise ValueError(
-                    f"summ_history untuk NPK {record['npk']} "
-                    "bukan objek JSON. Periksa datanya sebelum impor."
+                    "summ_history untuk master "
+                    f"{existing.get('nama')} "
+                    f"(NPK master {existing.get('npk')}) "
+                    "bukan objek JSON. Periksa data sebelum impor."
                 )
 
-            # Salin histori agar periode lain tidak hilang.
+            # Salin histori sebelumnya.
+            # Key periode + office yang sama akan diganti.
             new_history = dict(history)
             new_history[history_key] = history_entry
+
+            master_id = existing.get("id")
+
+            if master_id is None:
+                raise ValueError(
+                    "Master salesman tidak memiliki kolom id. "
+                    "Impor dibatalkan agar update tidak mengenai "
+                    "lebih dari satu baris."
+                )
 
             (
                 client.table("salesmen")
                 .update({
                     "summ_history": new_history,
                 })
-                .eq("npk", record["npk"])
+                .eq("id", master_id)
                 .execute()
             )
 
+            # Perbarui cache lokal agar record berikutnya
+            # menggunakan histori paling baru.
+            existing["summ_history"] = new_history
             updated += 1
 
         else:
-            # Jika NPK belum ada, buat master salesman.
-            # Pastikan kolom lain pada skema database mengizinkan
-            # nilai default atau NULL untuk field yang tidak disertakan.
-            (
+            # Tidak ditemukan master dengan nama + office yang cocok
+            # dan NPK SUMM belum digunakan master lain.
+            insert_payload = {
+                "npk": record["npk"],
+                "nama": record["nama"],
+                "sales_office": sales_office,
+                "summ_history": {
+                    history_key: history_entry,
+                },
+            }
+
+            response = (
                 client.table("salesmen")
-                .insert({
-                    "npk": record["npk"],
-                    "nama": record["nama"],
-                    "sales_office": sales_office,
-                    "summ_history": {
-                        history_key: history_entry,
-                    },
-                })
+                .insert(insert_payload)
                 .execute()
             )
 
             inserted += 1
+
+            # Simpan row baru ke cache untuk pemeriksaan berikutnya.
+            inserted_rows = response.data or []
+
+            if inserted_rows:
+                master_rows.extend(inserted_rows)
+            else:
+                # Jika respons insert tidak mengembalikan row,
+                # tambahkan representasi minimal ke cache.
+                master_rows.append({
+                    "id": None,
+                    "npk": record["npk"],
+                    "nama": record["nama"],
+                    "sales_office": sales_office,
+                    "grup_product": None,
+                    "summ_history": {
+                        history_key: history_entry,
+                    },
+                })
 
     return {
         "message": "Impor SUMM berhasil.",
@@ -694,6 +841,8 @@ def get_salesman_summ(
 
             results.append({
                 **entry,
+                # Utamakan NPK dan nama dari histori SUMM.
+                # NPK master digunakan hanya jika histori kosong.
                 "npk": entry.get("npk") or row.get("npk"),
                 "nama": entry.get("nama") or row.get("nama"),
                 "sales_office": (
