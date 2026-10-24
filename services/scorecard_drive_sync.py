@@ -32,7 +32,6 @@ def get_drive_credentials():
 
     if credentials_json:
         info = json.loads(credentials_json)
-
         return service_account.Credentials.from_service_account_info(
             info,
             scopes=DRIVE_READONLY_SCOPE,
@@ -44,7 +43,6 @@ def get_drive_credentials():
         ).decode("utf-8")
 
         info = json.loads(decoded)
-
         return service_account.Credentials.from_service_account_info(
             info,
             scopes=DRIVE_READONLY_SCOPE,
@@ -69,7 +67,7 @@ def get_drive_credentials():
 
 
 def download_scorecard_excel(file_id=None):
-    """Mengunduh file Excel dari Google Drive tanpa mengubah database."""
+    """Mengunduh Excel terbaru dari Google Drive tanpa mengubah database."""
     resolved_file_id = (
         file_id or os.getenv("GOOGLE_DRIVE_SCORECARD_FILE_ID")
     )
@@ -112,7 +110,6 @@ def download_scorecard_excel(file_id=None):
     downloader = MediaIoBaseDownload(buffer, request)
 
     done = False
-
     while not done:
         _, done = downloader.next_chunk()
 
@@ -121,26 +118,40 @@ def download_scorecard_excel(file_id=None):
     if not file_bytes:
         raise ValueError("File Excel yang diunduh kosong.")
 
-    file_hash = hashlib.sha256(file_bytes).hexdigest()
-
     return {
-        "file_id": resolved_file_id,
+        "file_id": metadata["id"],
         "file_name": metadata["name"],
         "modified_time": metadata.get("modifiedTime"),
         "size_bytes": len(file_bytes),
         "md5_checksum": metadata.get("md5Checksum"),
-        "sha256": file_hash,
+        "sha256": hashlib.sha256(file_bytes).hexdigest(),
         "file_bytes": file_bytes,
     }
 
 
 def _build_source_path(file_id, sales_office, report_period):
-    """Membuat identitas sumber unik untuk file, kantor, dan periode."""
+    """Membuat identitas sumber untuk file, kantor, dan periode."""
     return (
         f"google-drive:{file_id}"
         f":office={sales_office}"
         f":period={report_period}"
     )
+
+
+def _get_source_status(client, sales_office, report_period):
+    """Mengambil status sync sebelumnya."""
+    rows = (
+        client.table("scorecard_sources")
+        .select("last_file_hash,sync_status,last_synced_at")
+        .eq("sales_office", sales_office)
+        .eq("report_period", report_period)
+        .limit(1)
+        .execute()
+        .data
+        or []
+    )
+
+    return rows[0] if rows else None
 
 
 def sync_scorecard_from_drive(
@@ -150,23 +161,27 @@ def sync_scorecard_from_drive(
     file_id=None,
     db_client=None,
     downloader=None,
+    force_reconcile=False,
 ):
     """
-    Memvalidasi atau menyinkronkan Scorecard dari Google Drive.
+    Validasi atau sinkronisasi workbook Excel dari Google Drive.
 
     dry_run=True:
-        Mengunduh dan memvalidasi file tanpa query atau penulisan DB.
+        Mengunduh dan memvalidasi workbook tanpa mengubah database.
 
     dry_run=False:
-        Memvalidasi file, memeriksa hash, mengimpor data,
-        lalu memperbarui status sinkronisasi.
+        Membandingkan hash, mengimpor jika diperlukan, dan mencatat status.
+
+    force_reconcile=True:
+        Tetap menjalankan impor meskipun hash file tidak berubah.
+        Berguna untuk memperbaiki atau merekonsiliasi data database.
     """
     configured_office = os.getenv(
         "SCORECARD_SALES_OFFICE", ""
     ).strip()
 
-    sales_office = str(sales_office).strip()
-    report_period = str(report_period).strip()
+    sales_office = str(sales_office or "").strip()
+    report_period = str(report_period or "").strip()
 
     if not sales_office:
         raise ValueError("sales_office tidak boleh kosong.")
@@ -180,23 +195,32 @@ def sync_scorecard_from_drive(
         )
 
     if file_id is not None:
-        file_id = file_id.strip()
-
+        file_id = str(file_id).strip()
         if not file_id:
             raise ValueError("file_id tidak boleh kosong.")
+
+    configured_file_id = (
+        file_id or os.getenv("GOOGLE_DRIVE_SCORECARD_FILE_ID", "")
+    )
+
+    if not configured_file_id:
+        raise RuntimeError(
+            "GOOGLE_DRIVE_SCORECARD_FILE_ID belum dikonfigurasi."
+        )
 
     fetch_file = downloader or download_scorecard_excel
 
     remote = {}
-
     source_path = _build_source_path(
-        file_id or os.getenv("GOOGLE_DRIVE_SCORECARD_FILE_ID", ""),
+        configured_file_id,
         sales_office,
         report_period,
     )
 
+    client = db_client if db_client is not None else supabase
+
     try:
-        # 1. Unduh file dari Google Drive.
+        # 1. Unduh file terbaru dari Google Drive.
         remote = fetch_file(file_id=file_id)
 
         actual_file_id = remote.get("file_id")
@@ -221,14 +245,14 @@ def sync_scorecard_from_drive(
                 "Downloader tidak mengembalikan SHA-256 file."
             )
 
-        # 2. Identitas sumber untuk file, kantor, dan periode.
         source_path = _build_source_path(
             actual_file_id,
             sales_office,
             report_period,
         )
 
-        # 3. Validasi workbook sebelum proses impor.
+        # 2. Validasi workbook, termasuk validasi yang dilakukan
+        #    oleh import_scorecard_excel untuk sheet yang didukung.
         validation = import_scorecard_excel(
             file_bytes=remote["file_bytes"],
             sales_office=sales_office,
@@ -237,7 +261,7 @@ def sync_scorecard_from_drive(
             dry_run=True,
         )
 
-        # 4. Dry-run tidak melakukan query atau penulisan database.
+        # 3. Dry-run berhenti di sini tanpa query/penulisan database.
         if dry_run:
             return {
                 **validation,
@@ -246,6 +270,7 @@ def sync_scorecard_from_drive(
                 ),
                 "dry_run": True,
                 "changed": None,
+                "reconciled": False,
                 "sha256": remote["sha256"],
                 "file_id": actual_file_id,
                 "file_name": remote["file_name"],
@@ -253,40 +278,48 @@ def sync_scorecard_from_drive(
                 "sync_status": "validation_only",
             }
 
-        # 5. Pilih klien database untuk impor aktual.
-        client = db_client if db_client is not None else supabase
-
-        # 6. Cari catatan sumber untuk kantor dan periode ini.
-        source_rows = (
-            client.table("scorecard_sources")
-            .select("last_file_hash,sync_status")
-            .eq("sales_office", sales_office)
-            .eq("report_period", report_period)
-            .limit(1)
-            .execute()
-            .data
-            or []
+        # 4. Periksa status sinkronisasi sebelumnya.
+        previous = _get_source_status(
+            client,
+            sales_office,
+            report_period,
         )
 
         previous_hash = (
-            source_rows[0].get("last_file_hash")
-            if source_rows
-            else None
+            previous.get("last_file_hash") if previous else None
         )
-
         previous_status = (
-            source_rows[0].get("sync_status")
-            if source_rows
-            else None
+            previous.get("sync_status") if previous else None
         )
 
-        # Lewati hanya jika hash sama dan sinkronisasi sebelumnya sukses.
         file_unchanged = (
             previous_hash == remote["sha256"]
             and previous_status == "synced"
         )
 
-        # 7. Impor data aktual.
+        # 5. Jika file sama dan status sebelumnya sukses,
+        #    lewati impor kecuali force_reconcile=True.
+        if file_unchanged and not force_reconcile:
+            return {
+                **validation,
+                "message": (
+                    "File tidak berubah. Impor dilewati."
+                ),
+                "changed": False,
+                "reconciled": False,
+                "dry_run": False,
+                "file_id": actual_file_id,
+                "file_name": remote["file_name"],
+                "sha256": remote["sha256"],
+                "sales_office": sales_office,
+                "report_period": report_period,
+                "sync_status": "synced",
+                "last_synced_at": previous.get("last_synced_at"),
+            }
+
+        # 6. Impor workbook terbaru.
+        #    Fungsi impor bertanggung jawab memproses sheet dan
+        #    menyimpan data ke tabel yang sesuai.
         import_result = import_scorecard_excel(
             file_bytes=remote["file_bytes"],
             sales_office=sales_office,
@@ -296,7 +329,7 @@ def sync_scorecard_from_drive(
             db_client=client,
         )
 
-        # 8. Catat status synced.
+        # 7. Catat status sukses setelah impor selesai.
         _write_source_status(
             client=client,
             sales_office=sales_office,
@@ -310,7 +343,7 @@ def sync_scorecard_from_drive(
         return {
             **import_result,
             "message": (
-                "File tidak berubah; rekonsiliasi database tetap dijalankan."
+                "Sinkronisasi berhasil; rekonsiliasi database selesai."
                 if file_unchanged
                 else "Sinkronisasi Scorecard berhasil."
             ),
@@ -326,11 +359,9 @@ def sync_scorecard_from_drive(
         }
 
     except Exception as exc:
-        # Catat error hanya untuk proses sinkronisasi aktual.
+        # Catat error hanya pada sync aktual.
         if not dry_run:
             try:
-                client = db_client if db_client is not None else supabase
-
                 _write_source_status(
                     client=client,
                     sales_office=sales_office,
@@ -341,7 +372,7 @@ def sync_scorecard_from_drive(
                     error=str(exc),
                 )
             except Exception:
-                # Jangan menutupi error utama dengan error pencatatan.
+                # Pertahankan exception utama.
                 pass
 
         raise
@@ -356,10 +387,7 @@ def _write_source_status(
     status,
     error,
 ):
-    """
-    Memperbarui catatan sumber yang sudah ada untuk kantor dan periode.
-    Jika belum ada, buat catatan baru.
-    """
+    """Insert atau update status sumber berdasarkan kantor dan periode."""
     row = {
         "source_name": "Google Drive Scorecard",
         "file_name": remote.get("file_name") or source_path,
@@ -379,7 +407,6 @@ def _write_source_status(
             timezone.utc
         ).isoformat()
 
-    # Constraint unik database adalah (sales_office, report_period).
     existing_rows = (
         client.table("scorecard_sources")
         .select("source_path")
@@ -392,8 +419,6 @@ def _write_source_status(
     )
 
     if existing_rows:
-        existing_source_path = existing_rows[0].get("source_path")
-
         (
             client.table("scorecard_sources")
             .update(row)
