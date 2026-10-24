@@ -13,6 +13,7 @@ from googleapiclient.http import MediaIoBaseDownload
 
 from database import supabase
 from services.scorecard_service import import_scorecard_excel
+from services.salesmen_service import import_salesman_summ_excel
 
 
 DRIVE_READONLY_SCOPE = [
@@ -154,6 +155,62 @@ def _get_source_status(client, sales_office, report_period):
     return rows[0] if rows else None
 
 
+def _validate_workbook(
+    file_bytes,
+    sales_office,
+    report_period,
+    source_file,
+):
+    """
+    Validasi kedua sheet tanpa perubahan database.
+    Keduanya harus lolos sebelum sinkronisasi aktual dimulai.
+    """
+    productivity_validation = import_scorecard_excel(
+        file_bytes=file_bytes,
+        sales_office=sales_office,
+        report_period=report_period,
+        source_file=source_file,
+        dry_run=True,
+    )
+
+    summ_validation = import_salesman_summ_excel(
+        file_bytes=file_bytes,
+        sales_office=sales_office,
+        report_period=report_period,
+        source_file=source_file,
+        dry_run=True,
+    )
+
+    return {
+        "productivity_validation": productivity_validation,
+        "summ_validation": summ_validation,
+        "productivity_rows_validated": (
+            productivity_validation.get("sheet_rows_imported", 0)
+        ),
+        "summ_rows_validated": (
+            summ_validation.get("summ_rows_imported", 0)
+        ),
+    }
+
+
+def _import_summ(
+    file_bytes,
+    sales_office,
+    report_period,
+    source_file,
+    client,
+):
+    """Menjalankan impor SUMM ke salesmen.summ_history."""
+    return import_salesman_summ_excel(
+        file_bytes=file_bytes,
+        sales_office=sales_office,
+        report_period=report_period,
+        source_file=source_file,
+        dry_run=False,
+        db_client=client,
+    )
+
+
 def sync_scorecard_from_drive(
     sales_office,
     report_period,
@@ -167,14 +224,14 @@ def sync_scorecard_from_drive(
     Validasi atau sinkronisasi workbook Excel dari Google Drive.
 
     dry_run=True:
-        Mengunduh dan memvalidasi workbook tanpa mengubah database.
+        Mengunduh dan memvalidasi sheet Produktifitas serta SUMM
+        tanpa perubahan database.
 
     dry_run=False:
-        Membandingkan hash, mengimpor jika diperlukan, dan mencatat status.
+        Mengimpor Produktifitas dan SUMM, lalu mencatat status.
 
     force_reconcile=True:
-        Tetap menjalankan impor meskipun hash file tidak berubah.
-        Berguna untuk memperbaiki atau merekonsiliasi data database.
+        Memaksa rekonsiliasi data meskipun hash file tidak berubah.
     """
     configured_office = os.getenv(
         "SCORECARD_SALES_OFFICE", ""
@@ -209,6 +266,7 @@ def sync_scorecard_from_drive(
         )
 
     fetch_file = downloader or download_scorecard_excel
+    client = db_client if db_client is not None else supabase
 
     remote = {}
     source_path = _build_source_path(
@@ -217,10 +275,8 @@ def sync_scorecard_from_drive(
         report_period,
     )
 
-    client = db_client if db_client is not None else supabase
-
     try:
-        # 1. Unduh file terbaru dari Google Drive.
+        # 1. Unduh workbook terbaru.
         remote = fetch_file(file_id=file_id)
 
         actual_file_id = remote.get("file_id")
@@ -251,22 +307,20 @@ def sync_scorecard_from_drive(
             report_period,
         )
 
-        # 2. Validasi workbook, termasuk validasi yang dilakukan
-        #    oleh import_scorecard_excel untuk sheet yang didukung.
-        validation = import_scorecard_excel(
+        # 2. Validasi kedua sheet sebelum menulis apa pun.
+        validation = _validate_workbook(
             file_bytes=remote["file_bytes"],
             sales_office=sales_office,
             report_period=report_period,
             source_file=remote["file_name"],
-            dry_run=True,
         )
 
-        # 3. Dry-run berhenti di sini tanpa query/penulisan database.
         if dry_run:
             return {
                 **validation,
                 "message": (
-                    "Validasi berhasil. Tidak ada perubahan database."
+                    "Validasi kedua sheet berhasil. "
+                    "Tidak ada perubahan database."
                 ),
                 "dry_run": True,
                 "changed": None,
@@ -274,11 +328,12 @@ def sync_scorecard_from_drive(
                 "sha256": remote["sha256"],
                 "file_id": actual_file_id,
                 "file_name": remote["file_name"],
+                "sales_office": sales_office,
                 "report_period": report_period,
                 "sync_status": "validation_only",
             }
 
-        # 4. Periksa status sinkronisasi sebelumnya.
+        # 3. Periksa status sync sebelumnya.
         previous = _get_source_status(
             client,
             sales_office,
@@ -297,16 +352,28 @@ def sync_scorecard_from_drive(
             and previous_status == "synced"
         )
 
-        # 5. Jika file sama dan status sebelumnya sukses,
-        #    lewati impor kecuali force_reconcile=True.
+        # 4. Jika file sama dan tidak dipaksa rekonsiliasi,
+        #    tetap jalankan impor SUMM. Ini memungkinkan histori SUMM
+        #    diperbaiki tanpa mengimpor ulang Produktifitas.
         if file_unchanged and not force_reconcile:
+            summ_result = _import_summ(
+                file_bytes=remote["file_bytes"],
+                sales_office=sales_office,
+                report_period=report_period,
+                source_file=remote["file_name"],
+                client=client,
+            )
+
             return {
                 **validation,
                 "message": (
-                    "File tidak berubah. Impor dilewati."
+                    "File tidak berubah. Produktifitas dilewati; "
+                    "SUMM berhasil direkonsiliasi."
                 ),
+                "productivity_import_skipped": True,
+                "summ_import": summ_result,
                 "changed": False,
-                "reconciled": False,
+                "reconciled": True,
                 "dry_run": False,
                 "file_id": actual_file_id,
                 "file_name": remote["file_name"],
@@ -317,10 +384,8 @@ def sync_scorecard_from_drive(
                 "last_synced_at": previous.get("last_synced_at"),
             }
 
-        # 6. Impor workbook terbaru.
-        #    Fungsi impor bertanggung jawab memproses sheet dan
-        #    menyimpan data ke tabel yang sesuai.
-        import_result = import_scorecard_excel(
+        # 5. Impor Produktifitas melalui importer yang sudah ada.
+        productivity_result = import_scorecard_excel(
             file_bytes=remote["file_bytes"],
             sales_office=sales_office,
             report_period=report_period,
@@ -329,7 +394,16 @@ def sync_scorecard_from_drive(
             db_client=client,
         )
 
-        # 7. Catat status sukses setelah impor selesai.
+        # 6. Impor SUMM ke salesmen.summ_history.
+        summ_result = _import_summ(
+            file_bytes=remote["file_bytes"],
+            sales_office=sales_office,
+            report_period=report_period,
+            source_file=remote["file_name"],
+            client=client,
+        )
+
+        # 7. Catat status hanya setelah kedua impor selesai.
         _write_source_status(
             client=client,
             sales_office=sales_office,
@@ -341,12 +415,9 @@ def sync_scorecard_from_drive(
         )
 
         return {
-            **import_result,
-            "message": (
-                "Sinkronisasi berhasil; rekonsiliasi database selesai."
-                if file_unchanged
-                else "Sinkronisasi Scorecard berhasil."
-            ),
+            "message": "Sinkronisasi Produktifitas dan SUMM berhasil.",
+            "productivity_import": productivity_result,
+            "summ_import": summ_result,
             "changed": not file_unchanged,
             "reconciled": True,
             "dry_run": False,
@@ -359,7 +430,7 @@ def sync_scorecard_from_drive(
         }
 
     except Exception as exc:
-        # Catat error hanya pada sync aktual.
+        # Catat error hanya untuk sinkronisasi aktual.
         if not dry_run:
             try:
                 _write_source_status(
@@ -372,7 +443,7 @@ def sync_scorecard_from_drive(
                     error=str(exc),
                 )
             except Exception:
-                # Pertahankan exception utama.
+                # Jangan mengganti exception utama.
                 pass
 
         raise
